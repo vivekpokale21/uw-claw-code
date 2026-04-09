@@ -8,6 +8,7 @@ Last updated: 2026-04-09
 - Local-first migration slice status:
   - Slice 1 complete (2026-04-09): Rust default model is now `qwen3.5:4b`, OpenAI-compatible default endpoint is now localhost-first (`http://127.0.0.1:8080/v1`), `LLM_BASE_URL` takes precedence over `OPENAI_BASE_URL`, and OpenAI-compatible localhost runs allow missing API key.
   - Slice 2 complete (2026-04-09): Rust slash parity now includes `/budget`, `/checkpoint`, `/list-runs`, `/show-run`; REPL unknown slash inputs now passthrough as prompt text so absolute path prompts are not blocked.
+  - Slice 3 complete (2026-04-09): Rust runtime loop now reports deterministic `tool_loop_stalled` / `no_progress_stalled` stop reasons with bounded repeat guards, plus pre-turn budget status and pre-turn auto-compaction in REPL flow.
 - Requested 9-lane checkpoint: **All 9 lanes merged on `main`.**
 - Current `main` HEAD: `ee31e00` (stub implementations replaced with real AskUserQuestion + RemoteTrigger).
 - Repository stats at this checkpoint: **292 commits on `main` / 293 across all branches**, **9 crates**, **48,599 tracked Rust LOC**, **2,568 test LOC**, **3 authors**, date range **2026-03-31 → 2026-04-03**.

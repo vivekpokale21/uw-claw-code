@@ -13,6 +13,10 @@
   - Rust slash-command parser and runtime dispatch now support `/budget`, `/checkpoint`, `/list-runs`, `/show-run`.
   - REPL now passthroughs unknown slash inputs as prompt text (absolute path prompts no longer fail command parsing).
   - Run inspection reads autonomous checkpoint artifacts from `<git-root>/.port_sessions`.
+- 2026-04-09 — Slice 3 complete:
+  - Rust conversation runtime now emits deterministic stall stop reasons (`tool_loop_stalled`, `no_progress_stalled`) with explicit bounded guards.
+  - Rust REPL loop now surfaces pre-turn context budget status and runs pre-turn auto-compaction when context pressure is high.
+  - Loop reliability guardrails are now env-configurable via `CLAW_TOOL_LOOP_STALL_LIMIT` and `CLAW_NO_PROGRESS_STALL_LIMIT`.
 
 ## Goal
 

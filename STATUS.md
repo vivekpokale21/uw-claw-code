@@ -23,9 +23,20 @@ Last updated: 2026-04-09
 - Run-inspection reads checkpoint artifacts from `<git-root>/.port_sessions/autonomous_<run-id>.json`.
 - Unknown slash commands in the REPL now passthrough to prompt text (for example absolute path prompts like `/home/...`) instead of being hard-rejected as command errors.
 
+### Slice 3 — Rust loop reliability bounds + deterministic stall reasons (2026-04-09)
+
+- Runtime conversation loop now enforces deterministic stop reasons for reliability guardrails:
+  - `stop_reason=tool_loop_stalled` when identical tool call+input repeats past configured threshold.
+  - `stop_reason=no_progress_stalled` when identical tool plan repeats across iterations past configured threshold.
+- Added configurable runtime guards (env-driven defaults):
+  - `CLAW_TOOL_LOOP_STALL_LIMIT` (default `4`)
+  - `CLAW_NO_PROGRESS_STALL_LIMIT` (default `3`)
+- Rust REPL loop now prints pre-turn context budget status and runs pre-turn auto-compaction when context exceeds threshold.
+- Added pre-turn auto-compaction reliability path using model-aware context thresholds (`AUTO_COMPACT_TRIGGER_PERCENT=85`) before model calls.
+
 ## Current Status
 
-Slice 2 of Claude Code workflow reconstruction for AFK reliability is now implemented on top of
+Slice 3 of Claude Code workflow reconstruction for AFK reliability is now implemented on top of
 `llama.cpp + qwen3.5:4b`.
 
 Background framing for continuity:

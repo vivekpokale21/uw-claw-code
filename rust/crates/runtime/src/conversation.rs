@@ -5,7 +5,7 @@ use serde_json::{Map, Value};
 use telemetry::SessionTracer;
 
 use crate::compact::{
-    compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
+    CompactionConfig, CompactionResult, compact_session, estimate_session_tokens,
 };
 use crate::config::RuntimeFeatureConfig;
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
@@ -17,6 +17,10 @@ use crate::usage::{TokenUsage, UsageTracker};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
+const DEFAULT_TOOL_LOOP_STALL_LIMIT: usize = 4;
+const DEFAULT_NO_PROGRESS_STALL_LIMIT: usize = 3;
+const TOOL_LOOP_STALL_LIMIT_ENV_VAR: &str = "CLAW_TOOL_LOOP_STALL_LIMIT";
+const NO_PROGRESS_STALL_LIMIT_ENV_VAR: &str = "CLAW_NO_PROGRESS_STALL_LIMIT";
 
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,6 +137,8 @@ pub struct ConversationRuntime<C, T> {
     usage_tracker: UsageTracker,
     hook_runner: HookRunner,
     auto_compaction_input_tokens_threshold: u32,
+    tool_loop_stall_limit: usize,
+    no_progress_stall_limit: usize,
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     session_tracer: Option<SessionTracer>,
@@ -182,6 +188,8 @@ where
             usage_tracker,
             hook_runner: HookRunner::from_feature_config(feature_config),
             auto_compaction_input_tokens_threshold: auto_compaction_threshold_from_env(),
+            tool_loop_stall_limit: tool_loop_stall_limit_from_env(),
+            no_progress_stall_limit: no_progress_stall_limit_from_env(),
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
             session_tracer: None,
@@ -197,6 +205,18 @@ where
     #[must_use]
     pub fn with_auto_compaction_input_tokens_threshold(mut self, threshold: u32) -> Self {
         self.auto_compaction_input_tokens_threshold = threshold;
+        self
+    }
+
+    #[must_use]
+    pub fn with_tool_loop_stall_limit(mut self, limit: usize) -> Self {
+        self.tool_loop_stall_limit = limit.max(1);
+        self
+    }
+
+    #[must_use]
+    pub fn with_no_progress_stall_limit(mut self, limit: usize) -> Self {
+        self.no_progress_stall_limit = limit.max(1);
         self
     }
 
@@ -308,6 +328,9 @@ where
         let mut tool_results = Vec::new();
         let mut prompt_cache_events = Vec::new();
         let mut iterations = 0;
+        let mut repeated_tool_signatures = BTreeMap::<String, usize>::new();
+        let mut last_tool_plan_signature: Option<String> = None;
+        let mut no_progress_streak = 0usize;
 
         loop {
             iterations += 1;
@@ -358,6 +381,23 @@ where
                 pending_tool_uses.len(),
             );
 
+            if !pending_tool_uses.is_empty() {
+                let tool_plan_signature = tool_plan_signature(&pending_tool_uses);
+                if last_tool_plan_signature.as_deref() == Some(tool_plan_signature.as_str()) {
+                    no_progress_streak += 1;
+                } else {
+                    no_progress_streak = 1;
+                    last_tool_plan_signature = Some(tool_plan_signature);
+                }
+                if no_progress_streak >= self.no_progress_stall_limit {
+                    let error = RuntimeError::new(format!(
+                        "stop_reason=no_progress_stalled conversation loop repeated the same tool plan {no_progress_streak} times"
+                    ));
+                    self.record_turn_failed(iterations, &error);
+                    return Err(error);
+                }
+            }
+
             self.session
                 .push_message(assistant_message.clone())
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -372,6 +412,19 @@ where
                 let effective_input = pre_hook_result
                     .updated_input()
                     .map_or_else(|| input.clone(), ToOwned::to_owned);
+                let tool_signature = format!("{tool_name}\u{1f}{effective_input}");
+                let seen = repeated_tool_signatures
+                    .entry(tool_signature)
+                    .and_modify(|count| *count += 1)
+                    .or_insert(1);
+                if *seen > self.tool_loop_stall_limit {
+                    let error = RuntimeError::new(format!(
+                        "stop_reason=tool_loop_stalled tool `{tool_name}` repeated with identical input more than {} times",
+                        self.tool_loop_stall_limit
+                    ));
+                    self.record_turn_failed(iterations, &error);
+                    return Err(error);
+                }
                 let permission_context = PermissionContext::new(
                     pre_hook_result.permission_override(),
                     pre_hook_result.permission_reason().map(ToOwned::to_owned),
@@ -673,6 +726,40 @@ fn parse_auto_compaction_threshold(value: Option<&str>) -> u32 {
         .unwrap_or(DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD)
 }
 
+#[must_use]
+pub fn tool_loop_stall_limit_from_env() -> usize {
+    parse_positive_usize_limit(
+        std::env::var(TOOL_LOOP_STALL_LIMIT_ENV_VAR).ok().as_deref(),
+        DEFAULT_TOOL_LOOP_STALL_LIMIT,
+    )
+}
+
+#[must_use]
+pub fn no_progress_stall_limit_from_env() -> usize {
+    parse_positive_usize_limit(
+        std::env::var(NO_PROGRESS_STALL_LIMIT_ENV_VAR)
+            .ok()
+            .as_deref(),
+        DEFAULT_NO_PROGRESS_STALL_LIMIT,
+    )
+}
+
+#[must_use]
+fn parse_positive_usize_limit(value: Option<&str>, default: usize) -> usize {
+    value
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|limit| *limit > 0)
+        .unwrap_or(default)
+}
+
+fn tool_plan_signature(tool_uses: &[(String, String, String)]) -> String {
+    tool_uses
+        .iter()
+        .map(|(_, name, input)| format!("{name}\u{1f}{input}"))
+        .collect::<Vec<_>>()
+        .join("\u{1e}")
+}
+
 fn build_assistant_message(
     events: Vec<AssistantEvent>,
 ) -> Result<
@@ -792,10 +879,12 @@ impl ToolExecutor for StaticToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_assistant_message, parse_auto_compaction_threshold, ApiClient, ApiRequest,
-        AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
-        StaticToolExecutor, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent, ConversationRuntime,
+        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD, PromptCacheEvent, RuntimeError,
+        StaticToolExecutor, ToolExecutor, build_assistant_message, parse_auto_compaction_threshold,
+        parse_positive_usize_limit,
     };
+    use crate::ToolError;
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
     use crate::permissions::{
@@ -805,7 +894,6 @@ mod tests {
     use crate::prompt::{ProjectContext, SystemPromptBuilder};
     use crate::session::{ContentBlock, MessageRole, Session};
     use crate::usage::TokenUsage;
-    use crate::ToolError;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -821,10 +909,12 @@ mod tests {
             self.call_count += 1;
             match self.call_count {
                 1 => {
-                    assert!(request
-                        .messages
-                        .iter()
-                        .any(|message| message.role == MessageRole::User));
+                    assert!(
+                        request
+                            .messages
+                            .iter()
+                            .any(|message| message.role == MessageRole::User)
+                    );
                     Ok(vec![
                         AssistantEvent::TextDelta("Let me calculate that.".to_string()),
                         AssistantEvent::ToolUse {
@@ -1168,10 +1258,12 @@ mod tests {
                         AssistantEvent::MessageStop,
                     ]),
                     2 => {
-                        assert!(request
-                            .messages
-                            .iter()
-                            .any(|message| message.role == MessageRole::Tool));
+                        assert!(
+                            request
+                                .messages
+                                .iter()
+                                .any(|message| message.role == MessageRole::Tool)
+                        );
                         Ok(vec![
                             AssistantEvent::TextDelta("done".to_string()),
                             AssistantEvent::MessageStop,
@@ -1243,10 +1335,12 @@ mod tests {
                         AssistantEvent::MessageStop,
                     ]),
                     2 => {
-                        assert!(request
-                            .messages
-                            .iter()
-                            .any(|message| message.role == MessageRole::Tool));
+                        assert!(
+                            request
+                                .messages
+                                .iter()
+                                .any(|message| message.role == MessageRole::Tool)
+                        );
                         Ok(vec![
                             AssistantEvent::TextDelta("done".to_string()),
                             AssistantEvent::MessageStop,
@@ -1582,6 +1676,14 @@ mod tests {
     }
 
     #[test]
+    fn positive_limit_parser_defaults_and_rejects_zero() {
+        assert_eq!(parse_positive_usize_limit(None, 7), 7);
+        assert_eq!(parse_positive_usize_limit(Some("5"), 7), 5);
+        assert_eq!(parse_positive_usize_limit(Some("0"), 7), 7);
+        assert_eq!(parse_positive_usize_limit(Some("not-a-number"), 7), 7);
+    }
+
+    #[test]
     fn build_assistant_message_requires_message_stop_event() {
         // given
         let events = vec![AssistantEvent::TextDelta("hello".to_string())];
@@ -1591,9 +1693,11 @@ mod tests {
             .expect_err("assistant messages should require a stop event");
 
         // then
-        assert!(error
-            .to_string()
-            .contains("assistant stream ended without a message stop event"));
+        assert!(
+            error
+                .to_string()
+                .contains("assistant stream ended without a message stop event")
+        );
     }
 
     #[test]
@@ -1606,9 +1710,11 @@ mod tests {
             build_assistant_message(events).expect_err("assistant messages should require content");
 
         // then
-        assert!(error
-            .to_string()
-            .contains("assistant stream produced no content"));
+        assert!(
+            error
+                .to_string()
+                .contains("assistant stream produced no content")
+        );
     }
 
     #[test]
@@ -1661,9 +1767,91 @@ mod tests {
             .expect_err("conversation loop should stop after the configured limit");
 
         // then
-        assert!(error
-            .to_string()
-            .contains("conversation loop exceeded the maximum number of iterations"));
+        assert!(
+            error
+                .to_string()
+                .contains("conversation loop exceeded the maximum number of iterations")
+        );
+    }
+
+    #[test]
+    fn run_turn_errors_with_tool_loop_stall_stop_reason() {
+        struct LoopingApi;
+
+        impl ApiClient for LoopingApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: "tool-1".to_string(),
+                        name: "echo".to_string(),
+                        input: "payload".to_string(),
+                    },
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            LoopingApi,
+            StaticToolExecutor::new().register("echo", |input| Ok(input.to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_max_iterations(20)
+        .with_no_progress_stall_limit(20)
+        .with_tool_loop_stall_limit(2);
+
+        let error = runtime
+            .run_turn("loop", None)
+            .expect_err("tool loop should stop after repeated identical calls");
+
+        assert!(error.to_string().contains("stop_reason=tool_loop_stalled"));
+    }
+
+    #[test]
+    fn run_turn_errors_with_no_progress_stop_reason() {
+        struct LoopingApi;
+
+        impl ApiClient for LoopingApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: "tool-1".to_string(),
+                        name: "echo".to_string(),
+                        input: "payload".to_string(),
+                    },
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            LoopingApi,
+            StaticToolExecutor::new().register("echo", |input| Ok(input.to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_max_iterations(20)
+        .with_tool_loop_stall_limit(20)
+        .with_no_progress_stall_limit(2);
+
+        let error = runtime
+            .run_turn("loop", None)
+            .expect_err("turn should stop when no forward progress is detected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("stop_reason=no_progress_stalled")
+        );
     }
 
     #[test]

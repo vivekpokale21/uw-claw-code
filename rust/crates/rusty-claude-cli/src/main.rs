@@ -79,6 +79,7 @@ const BUILD_TARGET: Option<&str> = option_env!("TARGET");
 const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
 const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+const AUTO_COMPACT_TRIGGER_PERCENT: usize = 85;
 const DEFAULT_CHECKPOINT_LIST_LIMIT: usize = 20;
 const PRIMARY_SESSION_EXTENSION: &str = "jsonl";
 const LEGACY_SESSION_EXTENSION: &str = "json";
@@ -3613,6 +3614,8 @@ impl LiveCli {
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        self.print_turn_budget_status();
+        self.auto_compact_before_turn_if_needed()?;
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
@@ -3652,6 +3655,63 @@ impl LiveCli {
                 Err(Box::new(error))
             }
         }
+    }
+
+    fn print_turn_budget_status(&self) {
+        let max_tokens = usize::try_from(max_tokens_for_model(&self.model)).unwrap_or(usize::MAX);
+        let estimated_tokens = self.runtime.estimated_tokens();
+        let remaining_tokens = max_tokens.saturating_sub(estimated_tokens);
+        println!(
+            "[status] model={} perm={} ctx={}/{} remaining={}",
+            self.model,
+            self.permission_mode.as_str(),
+            estimated_tokens,
+            max_tokens,
+            remaining_tokens
+        );
+    }
+
+    fn auto_compact_before_turn_if_needed(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let max_tokens = usize::try_from(max_tokens_for_model(&self.model)).unwrap_or(usize::MAX);
+        if max_tokens == 0 {
+            return Ok(());
+        }
+        let estimated_before = self.runtime.estimated_tokens();
+        let trigger_threshold = max_tokens.saturating_mul(AUTO_COMPACT_TRIGGER_PERCENT) / 100;
+        if estimated_before < trigger_threshold {
+            return Ok(());
+        }
+
+        let result = self.runtime.compact(CompactionConfig {
+            max_estimated_tokens: trigger_threshold,
+            ..CompactionConfig::default()
+        });
+        if result.removed_message_count == 0 {
+            println!(
+                "[auto-compact] skipped: context remains high at {estimated_before}/{max_tokens} tokens"
+            );
+            return Ok(());
+        }
+
+        let estimated_after = runtime::estimate_session_tokens(&result.compacted_session);
+        let runtime = build_runtime(
+            result.compacted_session,
+            &self.session.id,
+            self.model.clone(),
+            self.system_prompt.clone(),
+            true,
+            true,
+            self.allowed_tools.clone(),
+            self.permission_mode,
+            None,
+        )?;
+        self.replace_runtime(runtime)?;
+        self.persist_session()?;
+        println!(
+            "[auto-compact] reduced context {estimated_before}->{estimated_after} tokens (removed {} messages)",
+            result.removed_message_count
+        );
+        Ok(())
     }
 
     fn run_turn_with_output(
