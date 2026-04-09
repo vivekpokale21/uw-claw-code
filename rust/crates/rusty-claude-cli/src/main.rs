@@ -2804,7 +2804,7 @@ fn run_resume_command(
         SlashCommand::Help => Ok(ResumeCommandOutcome {
             session: session.clone(),
             message: Some(render_repl_help()),
-            json: None,
+            json: Some(serde_json::json!({ "kind": "help", "text": render_repl_help() })),
         }),
         SlashCommand::Compact => {
             let result = runtime::compact_session(
@@ -2952,13 +2952,16 @@ fn run_resume_command(
                 json: Some(init_json_value(&message)),
             })
         }
-        SlashCommand::Diff => Ok(ResumeCommandOutcome {
-            session: session.clone(),
-            message: Some(render_diff_report_for(
-                session_path.parent().unwrap_or_else(|| Path::new(".")),
-            )?),
-            json: None,
-        }),
+        SlashCommand::Diff => {
+            let cwd = session_path.parent().unwrap_or_else(|| Path::new("."));
+            let message = render_diff_report_for(&cwd)?;
+            let json = render_diff_json_for(&cwd)?;
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(message),
+                json: Some(json),
+            })
+        }
         SlashCommand::Version => Ok(ResumeCommandOutcome {
             session: session.clone(),
             message: Some(render_version_report()),
@@ -5856,6 +5859,30 @@ fn render_diff_report_for(cwd: &Path) -> Result<String, Box<dyn std::error::Erro
     }
 
     Ok(format!("Diff\n\n{}", sections.join("\n\n")))
+}
+
+fn render_diff_json_for(cwd: &Path) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let in_git_repo = std::process::Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(cwd)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !in_git_repo {
+        return Ok(serde_json::json!({
+            "kind": "diff",
+            "result": "no_git_repo",
+            "detail": format!("{} is not inside a git project", cwd.display()),
+        }));
+    }
+    let staged = run_git_diff_command_in(cwd, &["diff", "--cached"])?;
+    let unstaged = run_git_diff_command_in(cwd, &["diff"])?;
+    Ok(serde_json::json!({
+        "kind": "diff",
+        "result": if staged.trim().is_empty() && unstaged.trim().is_empty() { "clean" } else { "changes" },
+        "staged": staged.trim(),
+        "unstaged": unstaged.trim(),
+    }))
 }
 
 fn run_git_diff_command_in(
