@@ -3047,10 +3047,19 @@ fn run_resume_command(
             let limit = parse_history_count(count.as_deref())
                 .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
             let entries = collect_session_prompt_history(session);
+            let shown: Vec<_> = entries.iter().rev().take(limit).rev().collect();
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(render_prompt_history_report(&entries, limit)),
-                json: None,
+                json: Some(serde_json::json!({
+                    "kind": "history",
+                    "total": entries.len(),
+                    "showing": shown.len(),
+                    "entries": shown.iter().map(|e| serde_json::json!({
+                        "timestamp_ms": e.timestamp_ms,
+                        "text": e.text,
+                    })).collect::<Vec<_>>(),
+                })),
             })
         }
         SlashCommand::Unknown(name) => Err(format_unknown_slash_command(name).into()),
