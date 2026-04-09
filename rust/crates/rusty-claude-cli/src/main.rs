@@ -59,7 +59,7 @@ use tools::{
     execute_tool, mvp_tool_specs, GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput,
 };
 
-const DEFAULT_MODEL: &str = "claude-opus-4-6";
+const DEFAULT_MODEL: &str = "qwen3.5:4b";
 fn max_tokens_for_model(model: &str) -> u32 {
     if model.contains("opus") {
         32_000
@@ -1047,6 +1047,13 @@ fn config_model_for_current_dir() -> Option<String> {
 fn resolve_repl_model(cli_model: String) -> String {
     if cli_model != DEFAULT_MODEL {
         return cli_model;
+    }
+    if let Some(env_model) = env::var("CLAW_DEFAULT_MODEL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return resolve_model_alias_with_config(&env_model);
     }
     if let Some(env_model) = env::var("ANTHROPIC_MODEL")
         .ok()
@@ -9709,21 +9716,21 @@ mod tests {
     }
 
     #[test]
-    fn resolve_repl_model_falls_back_to_anthropic_model_env_when_default() {
+    fn resolve_repl_model_falls_back_to_claw_default_model_env_when_default() {
         let _guard = env_lock();
         let root = temp_dir();
         fs::create_dir_all(&root).expect("root dir");
         let config_home = root.join("config");
         fs::create_dir_all(&config_home).expect("config home dir");
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
-        std::env::remove_var("ANTHROPIC_MODEL");
-        std::env::set_var("ANTHROPIC_MODEL", "sonnet");
+        std::env::remove_var("CLAW_DEFAULT_MODEL");
+        std::env::set_var("CLAW_DEFAULT_MODEL", "qwen3.5:4b");
 
         let resolved = with_current_dir(&root, || resolve_repl_model(DEFAULT_MODEL.to_string()));
 
-        assert_eq!(resolved, "claude-sonnet-4-6");
+        assert_eq!(resolved, "qwen3.5:4b");
 
-        std::env::remove_var("ANTHROPIC_MODEL");
+        std::env::remove_var("CLAW_DEFAULT_MODEL");
         std::env::remove_var("CLAW_CONFIG_HOME");
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -9736,7 +9743,7 @@ mod tests {
         let config_home = root.join("config");
         fs::create_dir_all(&config_home).expect("config home dir");
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
-        std::env::remove_var("ANTHROPIC_MODEL");
+        std::env::remove_var("CLAW_DEFAULT_MODEL");
 
         let resolved = with_current_dir(&root, || resolve_repl_model(DEFAULT_MODEL.to_string()));
 

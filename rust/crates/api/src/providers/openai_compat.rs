@@ -17,7 +17,7 @@ use crate::types::{
 use super::{preflight_message_request, Provider, ProviderFuture};
 
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
-pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+pub const DEFAULT_OPENAI_BASE_URL: &str = "http://127.0.0.1:8080/v1";
 pub const DEFAULT_DASHSCOPE_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
@@ -117,13 +117,16 @@ impl OpenAiCompatClient {
     }
 
     pub fn from_env(config: OpenAiCompatConfig) -> Result<Self, ApiError> {
-        let Some(api_key) = read_env_non_empty(config.api_key_env)? else {
+        let base_url = read_base_url(config);
+        let api_key = read_env_non_empty(config.api_key_env)?;
+        if api_key.is_none() && !(config.provider_name == "OpenAI" && is_local_base_url(&base_url))
+        {
             return Err(ApiError::missing_credentials(
                 config.provider_name,
                 config.credential_env_vars(),
             ));
-        };
-        Ok(Self::new(api_key, config))
+        }
+        Ok(Self::new(api_key.unwrap_or_default(), config))
     }
 
     #[must_use]
@@ -221,14 +224,15 @@ impl OpenAiCompatClient {
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
         let request_url = chat_completions_endpoint(&self.base_url);
-        self.http
+        let mut builder = self
+            .http
             .post(&request_url)
             .header("content-type", "application/json")
-            .bearer_auth(&self.api_key)
-            .json(&build_chat_completion_request(request, self.config()))
-            .send()
-            .await
-            .map_err(ApiError::from)
+            .json(&build_chat_completion_request(request, self.config()));
+        if !self.api_key.trim().is_empty() {
+            builder = builder.bearer_auth(&self.api_key);
+        }
+        builder.send().await.map_err(ApiError::from)
     }
 
     fn backoff_for_attempt(&self, attempt: u32) -> Result<Duration, ApiError> {
@@ -1060,7 +1064,24 @@ pub fn has_api_key(key: &str) -> bool {
 
 #[must_use]
 pub fn read_base_url(config: OpenAiCompatConfig) -> String {
-    std::env::var(config.base_url_env).unwrap_or_else(|_| config.default_base_url.to_string())
+    if config.provider_name == "OpenAI" {
+        if let Ok(value) = std::env::var("LLM_BASE_URL") {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return normalize_openai_base_url(trimmed);
+            }
+        }
+    }
+    let configured = std::env::var(config.base_url_env)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let resolved = configured.unwrap_or_else(|| config.default_base_url.to_string());
+    if config.provider_name == "OpenAI" {
+        normalize_openai_base_url(&resolved)
+    } else {
+        resolved
+    }
 }
 
 fn chat_completions_endpoint(base_url: &str) -> String {
@@ -1069,6 +1090,30 @@ fn chat_completions_endpoint(base_url: &str) -> String {
         trimmed.to_string()
     } else {
         format!("{trimmed}/chat/completions")
+    }
+}
+
+fn is_local_base_url(base_url: &str) -> bool {
+    let lower = base_url.to_ascii_lowercase();
+    lower.starts_with("http://127.0.0.1")
+        || lower.starts_with("https://127.0.0.1")
+        || lower.starts_with("http://localhost")
+        || lower.starts_with("https://localhost")
+        || lower.starts_with("http://0.0.0.0")
+        || lower.starts_with("https://0.0.0.0")
+        || lower.starts_with("http://[::1]")
+        || lower.starts_with("https://[::1]")
+}
+
+fn normalize_openai_base_url(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return DEFAULT_OPENAI_BASE_URL.to_string();
+    }
+    if trimmed.ends_with("/v1") || trimmed.ends_with("/chat/completions") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/v1")
     }
 }
 
@@ -1345,13 +1390,61 @@ mod tests {
             chat_completions_endpoint("https://api.x.ai/v1/chat/completions"),
             "https://api.x.ai/v1/chat/completions"
         );
+        assert_eq!(
+            chat_completions_endpoint("http://127.0.0.1:8080"),
+            "http://127.0.0.1:8080/chat/completions"
+        );
+    }
+
+    #[test]
+    fn default_openai_base_url_is_local_runtime_first() {
+        assert_eq!(super::DEFAULT_OPENAI_BASE_URL, "http://127.0.0.1:8080/v1");
+    }
+
+    #[test]
+    fn openai_base_url_prefers_llm_base_url_alias() {
+        let _lock = env_lock();
+        std::env::set_var("LLM_BASE_URL", "http://127.0.0.1:8129");
+        std::env::remove_var("OPENAI_BASE_URL");
+        assert_eq!(
+            super::read_base_url(OpenAiCompatConfig::openai()),
+            "http://127.0.0.1:8129/v1"
+        );
+        std::env::remove_var("LLM_BASE_URL");
+    }
+
+    #[test]
+    fn openai_from_env_allows_missing_key_for_local_runtime() {
+        let _lock = env_lock();
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::set_var("OPENAI_BASE_URL", "http://127.0.0.1:8080");
+        let result = OpenAiCompatClient::from_env(OpenAiCompatConfig::openai());
+        assert!(result.is_ok());
+        std::env::remove_var("OPENAI_BASE_URL");
+    }
+
+    #[test]
+    fn openai_from_env_requires_key_for_remote_runtime() {
+        let _lock = env_lock();
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::set_var("OPENAI_BASE_URL", "https://api.openai.com/v1");
+        let error = OpenAiCompatClient::from_env(OpenAiCompatConfig::openai())
+            .expect_err("remote openai should require api key");
+        assert!(matches!(
+            error,
+            ApiError::MissingCredentials {
+                provider: "OpenAI",
+                ..
+            }
+        ));
+        std::env::remove_var("OPENAI_BASE_URL");
     }
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
-            .expect("env lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     #[test]

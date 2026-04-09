@@ -202,8 +202,11 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
     if let Some(metadata) = metadata_for_model(model) {
         return metadata.provider;
     }
-    if anthropic::has_auth_from_env_or_saved().unwrap_or(false) {
-        return ProviderKind::Anthropic;
+    if model_prefers_openai_compat(model) {
+        return ProviderKind::OpenAi;
+    }
+    if has_local_openai_runtime_hint() {
+        return ProviderKind::OpenAi;
     }
     if openai_compat::has_api_key("OPENAI_API_KEY") {
         return ProviderKind::OpenAi;
@@ -211,7 +214,35 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
     if openai_compat::has_api_key("XAI_API_KEY") {
         return ProviderKind::Xai;
     }
-    ProviderKind::Anthropic
+    if anthropic::has_auth_from_env_or_saved().unwrap_or(false) {
+        return ProviderKind::Anthropic;
+    }
+    ProviderKind::OpenAi
+}
+
+#[must_use]
+fn model_prefers_openai_compat(model: &str) -> bool {
+    let lower = model.trim().to_ascii_lowercase();
+    lower.starts_with("qwen")
+        || lower.starts_with("llama")
+        || lower.starts_with("mistral")
+        || lower.starts_with("deepseek")
+        || lower.starts_with("phi")
+        || lower.contains(':')
+}
+
+#[must_use]
+fn has_local_openai_runtime_hint() -> bool {
+    std::env::var("LLM_BASE_URL")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+        || std::env::var("OPENAI_BASE_URL")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
 }
 
 #[must_use]
@@ -486,6 +517,11 @@ mod tests {
             detect_provider_kind("claude-sonnet-4-6"),
             ProviderKind::Anthropic
         );
+    }
+
+    #[test]
+    fn detects_openai_provider_for_local_qwen_model() {
+        assert_eq!(detect_provider_kind("qwen3.5:4b"), ProviderKind::OpenAi);
     }
 
     #[test]

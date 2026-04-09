@@ -1,10 +1,12 @@
 # Parity Status — claw-code Rust Port
 
-Last updated: 2026-04-03
+Last updated: 2026-04-09
 
 ## Summary
 
 - Canonical document: this top-level `PARITY.md` is the file consumed by `rust/scripts/run_mock_parity_diff.py`.
+- Local-first migration slice status:
+  - Slice 1 complete (2026-04-09): Rust default model is now `qwen3.5:4b`, OpenAI-compatible default endpoint is now localhost-first (`http://127.0.0.1:8080/v1`), `LLM_BASE_URL` takes precedence over `OPENAI_BASE_URL`, and OpenAI-compatible localhost runs allow missing API key.
 - Requested 9-lane checkpoint: **All 9 lanes merged on `main`.**
 - Current `main` HEAD: `ee31e00` (stub implementations replaced with real AskUserQuestion + RemoteTrigger).
 - Repository stats at this checkpoint: **292 commits on `main` / 293 across all branches**, **9 crates**, **48,599 tracked Rust LOC**, **2,568 test LOC**, **3 authors**, date range **2026-03-31 → 2026-04-03**.

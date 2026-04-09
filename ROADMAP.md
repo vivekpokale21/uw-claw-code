@@ -2,6 +2,14 @@
 
 # Clawable Coding Harness Roadmap
 
+## Migration Slice Tracking (AFK Local-First Port)
+
+- 2026-04-09 — Slice 1 complete:
+  - Rust default model switched to `qwen3.5:4b`.
+  - OpenAI-compatible runtime defaults switched to localhost-first (`http://127.0.0.1:8080/v1`).
+  - `LLM_BASE_URL` now overrides `OPENAI_BASE_URL` for OpenAI-compatible local runtime ergonomics.
+  - OpenAI-compatible localhost endpoint now supports no-key local runs.
+
 ## Goal
 
 Turn claw-code into the most **clawable** coding harness:
