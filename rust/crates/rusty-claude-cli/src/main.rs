@@ -3660,14 +3660,17 @@ impl LiveCli {
     fn print_turn_budget_status(&self) {
         let max_tokens = usize::try_from(max_tokens_for_model(&self.model)).unwrap_or(usize::MAX);
         let estimated_tokens = self.runtime.estimated_tokens();
-        let remaining_tokens = max_tokens.saturating_sub(estimated_tokens);
         println!(
-            "[status] model={} perm={} ctx={}/{} remaining={}",
-            self.model,
-            self.permission_mode.as_str(),
-            estimated_tokens,
-            max_tokens,
-            remaining_tokens
+            "{}",
+            format_turn_budget_status_line(
+                &self.model,
+                self.permission_mode.as_str(),
+                estimated_tokens,
+                max_tokens,
+                self.runtime.session().messages.len(),
+                self.runtime.usage().turns(),
+                &self.session.id,
+            )
         );
     }
 
@@ -5291,6 +5294,46 @@ fn format_status_report(
 
 ",
     )
+}
+
+fn format_turn_budget_status_line(
+    model: &str,
+    permission_mode: &str,
+    estimated_tokens: usize,
+    max_tokens: usize,
+    message_count: usize,
+    turns: u32,
+    session_id: &str,
+) -> String {
+    let remaining_tokens = max_tokens.saturating_sub(estimated_tokens);
+    let utilization_pct = if max_tokens == 0 {
+        0.0
+    } else {
+        ((estimated_tokens as f64) / (max_tokens as f64)) * 100.0
+    };
+    let pressure = context_pressure_level(utilization_pct);
+    format!(
+        "[status] model={model} perm={permission_mode} ctx={estimated_tokens}/{max_tokens} ({utilization_pct:.1}%) remaining={remaining_tokens} pressure={pressure} msgs={message_count} turns={turns} session={}",
+        short_session_label(session_id)
+    )
+}
+
+fn context_pressure_level(utilization_pct: f64) -> &'static str {
+    if utilization_pct >= 80.0 {
+        "high"
+    } else if utilization_pct >= 50.0 {
+        "medium"
+    } else {
+        "low"
+    }
+}
+
+fn short_session_label(session_id: &str) -> String {
+    const MAX_CHARS: usize = 9;
+    if session_id.chars().count() <= MAX_CHARS {
+        return session_id.to_string();
+    }
+    session_id.chars().take(MAX_CHARS).collect()
 }
 
 fn format_sandbox_report(status: &runtime::SandboxStatus) -> String {
@@ -8360,8 +8403,10 @@ mod tests {
         format_issue_report, format_model_report, format_model_switch_report,
         format_permissions_report, format_permissions_switch_report, format_pr_report,
         format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
+        format_turn_budget_status_line,
         format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error,
+        context_pressure_level,
         merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
         parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
         parse_history_count, parse_repl_slash_command, permission_policy, print_help_to,
@@ -10275,6 +10320,34 @@ mod tests {
         assert!(status.contains("Config files     loaded 2/3"));
         assert!(status.contains("Memory files     4"));
         assert!(status.contains("Suggested flow   /status → /diff → /commit"));
+    }
+
+    #[test]
+    fn turn_budget_status_line_reports_pressure_and_session_details() {
+        let line = format_turn_budget_status_line(
+            "qwen3.5:4b",
+            "workspace-write",
+            59_000,
+            64_000,
+            42,
+            9,
+            "session-1234567890",
+        );
+        assert!(line.contains("model=qwen3.5:4b"), "{line}");
+        assert!(line.contains("perm=workspace-write"), "{line}");
+        assert!(line.contains("ctx=59000/64000"), "{line}");
+        assert!(line.contains("pressure=high"), "{line}");
+        assert!(line.contains("msgs=42"), "{line}");
+        assert!(line.contains("turns=9"), "{line}");
+        assert!(line.contains("session=session-1"), "{line}");
+    }
+
+    #[test]
+    fn context_pressure_level_transitions_by_threshold() {
+        assert_eq!(context_pressure_level(49.9), "low");
+        assert_eq!(context_pressure_level(50.0), "medium");
+        assert_eq!(context_pressure_level(79.9), "medium");
+        assert_eq!(context_pressure_level(80.0), "high");
     }
 
     #[test]

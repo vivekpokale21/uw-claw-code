@@ -1043,7 +1043,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "list-runs",
-        aliases: &[],
+        aliases: &["runs"],
         summary: "List autonomous run checkpoints",
         argument_hint: Some("[limit]"),
         resume_supported: false,
@@ -1328,7 +1328,7 @@ pub fn validate_slash_command_input(
             session_path: Some(require_remainder(command, remainder, "<session-path>")?),
         },
         "checkpoint" => parse_checkpoint_command(&args)?,
-        "list-runs" => SlashCommand::ListRuns {
+        "list-runs" | "runs" => SlashCommand::ListRuns {
             limit: optional_single_arg(command, &args, "[limit]")?,
         },
         "show-run" => SlashCommand::ShowRun {
@@ -1651,6 +1651,10 @@ fn parse_checkpoint_command(args: &[&str]) -> Result<SlashCommand, SlashCommandP
         ["help" | "-h" | "--help"] => Ok(SlashCommand::Checkpoint {
             action: Some("help".to_string()),
             target: None,
+        }),
+        [run_id] if run_id.chars().all(|ch| ch.is_ascii_digit()) => Ok(SlashCommand::Checkpoint {
+            action: Some("list".to_string()),
+            target: Some((*run_id).to_string()),
         }),
         [run_id] => Ok(SlashCommand::Checkpoint {
             action: Some((*run_id).to_string()),
@@ -4337,6 +4341,19 @@ mod tests {
             SlashCommand::parse("/list-runs 8"),
             Ok(Some(SlashCommand::ListRuns {
                 limit: Some("8".to_string()),
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/runs 5"),
+            Ok(Some(SlashCommand::ListRuns {
+                limit: Some("5".to_string()),
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/checkpoint 9"),
+            Ok(Some(SlashCommand::Checkpoint {
+                action: Some("list".to_string()),
+                target: Some("9".to_string()),
             }))
         );
         assert_eq!(

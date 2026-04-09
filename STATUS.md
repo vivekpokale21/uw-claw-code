@@ -55,9 +55,23 @@ Last updated: 2026-04-09
   - override: `CLAW_LSP_HEALTH_STATE_FILE` or `LSP_HEALTH_STATE_FILE`
 - Rust tools `LSP` schema now includes `health` and `status` actions.
 
+### Slice 5 — Rust CLI UX polish (statusline, streaming, slash parity) (2026-04-09)
+
+- Rust interactive pre-turn statusline now includes richer operator context:
+  - context utilization percentage
+  - pressure band (`low`/`medium`/`high`)
+  - message/turn counters
+  - compact session id label
+- Rust slash parsing parity now includes:
+  - `/runs [limit]` alias for `/list-runs [limit]`
+  - numeric shorthand `/checkpoint <limit>` mapped to `/checkpoint list <limit>`
+- Added Rust regression coverage for:
+  - new statusline formatter pressure thresholds
+  - slash alias + checkpoint shorthand parser behavior
+
 ## Current Status
 
-Slice 4 of Claude Code workflow reconstruction for AFK reliability is now implemented on top of
+Slice 5 of Claude Code workflow reconstruction for AFK reliability is now implemented on top of
 `llama.cpp + qwen3.5:4b`.
 
 Background framing for continuity:

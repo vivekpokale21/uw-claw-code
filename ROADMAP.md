@@ -21,6 +21,10 @@
   - Rust LSP runtime now persists and reloads health telemetry in `.port_sessions/lsp_health_state.json` (with `CLAW_LSP_HEALTH_STATE_FILE`/`LSP_HEALTH_STATE_FILE` overrides).
   - Rust LSP dispatch now enforces cooldown-backed stop behavior after repeated failures on a per-language key.
   - Rust LSP tool surface now exposes `health`/`status` actions for runtime inspection.
+- 2026-04-09 — Slice 5 complete:
+  - Rust interactive pre-turn statusline now reports utilization %, pressure level, message/turn counters, and compact session id context.
+  - Slash command parsing now accepts `/runs [limit]` as an alias for `/list-runs [limit]`.
+  - Slash command parsing now treats `/checkpoint <limit>` as `/checkpoint list <limit>` for quick run-index inspection.
 
 ## Goal
 
