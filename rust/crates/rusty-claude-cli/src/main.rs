@@ -2935,11 +2935,15 @@ fn run_resume_command(
                 json: None,
             })
         }
-        SlashCommand::Config { section } => Ok(ResumeCommandOutcome {
-            session: session.clone(),
-            message: Some(render_config_report(section.as_deref())?),
-            json: None,
-        }),
+        SlashCommand::Config { section } => {
+            let message = render_config_report(section.as_deref())?;
+            let json = render_config_json(section.as_deref())?;
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(message),
+                json: Some(json),
+            })
+        }
         SlashCommand::Mcp { action, target } => {
             let cwd = env::current_dir()?;
             let args = match (action.as_deref(), target.as_deref()) {
@@ -5780,6 +5784,49 @@ fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::er
         "
 ",
     ))
+}
+
+fn render_config_json(
+    _section: Option<&str>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let loader = ConfigLoader::default_for(&cwd);
+    let discovered = loader.discover();
+    let runtime_config = loader.load()?;
+
+    let loaded_paths: Vec<_> = runtime_config
+        .loaded_entries()
+        .iter()
+        .map(|e| e.path.display().to_string())
+        .collect();
+
+    let files: Vec<_> = discovered
+        .iter()
+        .map(|e| {
+            let source = match e.source {
+                ConfigSource::User => "user",
+                ConfigSource::Project => "project",
+                ConfigSource::Local => "local",
+            };
+            let loaded = runtime_config
+                .loaded_entries()
+                .iter()
+                .any(|le| le.path == e.path);
+            serde_json::json!({
+                "path": e.path.display().to_string(),
+                "source": source,
+                "loaded": loaded,
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({
+        "kind": "config",
+        "cwd": cwd.display().to_string(),
+        "loaded_files": loaded_paths.len(),
+        "merged_keys": runtime_config.merged().len(),
+        "files": files,
+    }))
 }
 
 fn render_memory_report() -> Result<String, Box<dyn std::error::Error>> {
