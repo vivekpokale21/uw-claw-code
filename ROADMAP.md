@@ -37,6 +37,11 @@
   - edit reliability failed baseline gate (`1/8` successful target edits in isolated worktrees).
   - dominant issues were no-op/pseudo-tool-call completions, path targeting confusion, and degraded output text readability.
   - retrieval A/B phase is deferred until baseline capability reliability improves.
+- 2026-04-09 — Qwen3.5 compatibility hardening slice completed:
+  - Rust OpenAI-compatible provider now promotes Qwen textual tool-call payloads (`<tool_call><function=...><parameter=...>`) into executable tool-use events in both non-stream and stream paths.
+  - Rust OpenAI-compatible provider now handles legacy `function_call` fallback payloads for Qwen-family compatibility.
+  - post-patch 8-task ladder (`/tmp/qwen_matrix_postpatch_2026-04-09`) improved strict target-edit success from `1/8` to `3/8` while keeping stream-content failures at `0/8`.
+  - remaining blockers are timeout-prone wandering loops, partial task completion, and whitespace-collapsed write payload corruption on some edits.
 
 ## Goal
 

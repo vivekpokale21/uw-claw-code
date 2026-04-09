@@ -378,6 +378,7 @@ impl OpenAiSseParser {
 #[derive(Debug)]
 struct StreamState {
     model: String,
+    qwen_model: bool,
     message_started: bool,
     text_started: bool,
     text_finished: bool,
@@ -385,12 +386,15 @@ struct StreamState {
     stop_reason: Option<String>,
     usage: Option<Usage>,
     tool_calls: BTreeMap<u32, ToolCallState>,
+    buffered_text: String,
 }
 
 impl StreamState {
     fn new(model: String) -> Self {
+        let qwen_model = is_qwen_family_model(&model);
         Self {
             model,
+            qwen_model,
             message_started: false,
             text_started: false,
             text_finished: false,
@@ -398,6 +402,7 @@ impl StreamState {
             stop_reason: None,
             usage: None,
             tool_calls: BTreeMap::new(),
+            buffered_text: String::new(),
         }
     }
 
@@ -436,22 +441,40 @@ impl StreamState {
 
         for choice in chunk.choices {
             if let Some(content) = delta_text_content(&choice.delta) {
-                if !self.text_started {
-                    self.text_started = true;
-                    events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                if self.qwen_model {
+                    // Qwen3.5 local runtimes frequently emit textual
+                    // `<tool_call>` tags in content. Buffer text until finish so
+                    // we can promote those tags into executable tool-use blocks.
+                    self.buffered_text.push_str(&content);
+                } else {
+                    if !self.text_started {
+                        self.text_started = true;
+                        events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                            index: 0,
+                            content_block: OutputContentBlock::Text {
+                                text: String::new(),
+                            },
+                        }));
+                    }
+                    events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
                         index: 0,
-                        content_block: OutputContentBlock::Text {
-                            text: String::new(),
-                        },
+                        delta: ContentBlockDelta::TextDelta { text: content },
                     }));
                 }
-                events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
-                    index: 0,
-                    delta: ContentBlockDelta::TextDelta { text: content },
-                }));
             }
 
-            for tool_call in choice.delta.tool_calls {
+            let mut delta_tool_calls = choice.delta.tool_calls;
+            if delta_tool_calls.is_empty() {
+                if let Some(function_call) = choice.delta.function_call {
+                    delta_tool_calls.push(DeltaToolCall {
+                        index: 0,
+                        id: None,
+                        function: function_call,
+                    });
+                }
+            }
+
+            for tool_call in delta_tool_calls {
                 let state = self.tool_calls.entry(tool_call.index).or_default();
                 state.apply(tool_call);
                 let block_index = state.block_index();
@@ -499,11 +522,71 @@ impl StreamState {
         self.finished = true;
 
         let mut events = Vec::new();
-        if self.text_started && !self.text_finished {
+        if self.qwen_model {
+            let mut inferred_tool_calls = Vec::new();
+            let mut final_text = self.buffered_text.clone();
+            if self.tool_calls.is_empty() {
+                let parsed = parse_qwen_textual_tool_calls(&self.buffered_text);
+                final_text = parsed.remaining_text;
+                inferred_tool_calls = parsed.calls;
+            }
+
+            if !final_text.is_empty() {
+                self.text_started = true;
+                self.text_finished = true;
+                events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                    index: 0,
+                    content_block: OutputContentBlock::Text {
+                        text: String::new(),
+                    },
+                }));
+                events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                    index: 0,
+                    delta: ContentBlockDelta::TextDelta { text: final_text },
+                }));
+                events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                    index: 0,
+                }));
+            }
+
+            if !inferred_tool_calls.is_empty() {
+                let mut next_index = self
+                    .tool_calls
+                    .keys()
+                    .max()
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                for call in inferred_tool_calls {
+                    let arguments = call.function.arguments;
+                    events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                        index: next_index,
+                        content_block: OutputContentBlock::ToolUse {
+                            id: call.id,
+                            name: call.function.name,
+                            input: json!({}),
+                        },
+                    }));
+                    if !arguments.is_empty() {
+                        events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                            index: next_index,
+                            delta: ContentBlockDelta::InputJsonDelta {
+                                partial_json: arguments,
+                            },
+                        }));
+                    }
+                    events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                        index: next_index,
+                    }));
+                    next_index = next_index.saturating_add(1);
+                }
+                if matches!(self.stop_reason.as_deref(), None | Some("end_turn")) {
+                    self.stop_reason = Some("tool_use".to_string());
+                }
+            }
+        } else if self.text_started && !self.text_finished {
             self.text_finished = true;
-            events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
-                index: 0,
-            }));
+            events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent { index: 0 }));
         }
 
         for state in self.tool_calls.values_mut() {
@@ -637,15 +720,17 @@ struct ChatMessage {
     reasoning: Option<Value>,
     #[serde(default)]
     tool_calls: Vec<ResponseToolCall>,
+    #[serde(default)]
+    function_call: Option<ResponseToolFunction>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ResponseToolCall {
     id: String,
     function: ResponseToolFunction,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ResponseToolFunction {
     name: String,
     arguments: String,
@@ -687,6 +772,8 @@ struct ChunkDelta {
     reasoning: Option<Value>,
     #[serde(default)]
     tool_calls: Vec<DeltaToolCall>,
+    #[serde(default)]
+    function_call: Option<DeltaFunction>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -699,7 +786,7 @@ struct DeltaToolCall {
     function: DeltaFunction,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct DeltaFunction {
     #[serde(default)]
     name: Option<String>,
@@ -736,6 +823,14 @@ fn is_reasoning_model(model: &str) -> bool {
         || canonical.starts_with("qwen-qwq")
         || canonical.starts_with("qwq")
         || canonical.contains("thinking")
+}
+
+fn is_qwen_family_model(model: &str) -> bool {
+    let lowered = model.to_ascii_lowercase();
+    let canonical = lowered.rsplit('/').next().unwrap_or(lowered.as_str());
+    canonical.starts_with("qwen")
+        || canonical.starts_with("qwq")
+        || canonical.contains("qwen3")
 }
 
 /// Strip routing prefix (e.g., "openai/gpt-4" → "gpt-4") for the wire.
@@ -963,16 +1058,51 @@ fn normalize_response(
         .ok_or(ApiError::InvalidSseFrame(
             "chat completion response missing choices",
         ))?;
+    let mut native_tool_calls = choice.message.tool_calls.clone();
+    if native_tool_calls.is_empty() {
+        if let Some(function_call) = choice.message.function_call.clone() {
+            native_tool_calls.push(ResponseToolCall {
+                id: "tool_call_0".to_string(),
+                function: function_call,
+            });
+        }
+    }
+
     let mut content = Vec::new();
-    if let Some(text) = message_text_content(&choice.message) {
+    let mut inferred_tool_calls = Vec::new();
+    let mut text_content = message_text_content(&choice.message);
+    if native_tool_calls.is_empty() && is_qwen_family_model(model) {
+        if let Some(text) = text_content.as_ref() {
+            let parsed = parse_qwen_textual_tool_calls(text);
+            inferred_tool_calls = parsed.calls;
+            text_content = if parsed.remaining_text.is_empty() {
+                None
+            } else {
+                Some(parsed.remaining_text)
+            };
+        }
+    }
+
+    if let Some(text) = text_content {
         content.push(OutputContentBlock::Text { text });
     }
-    for tool_call in choice.message.tool_calls {
+    for tool_call in native_tool_calls.into_iter().chain(inferred_tool_calls) {
         content.push(OutputContentBlock::ToolUse {
             id: tool_call.id,
             name: tool_call.function.name,
             input: parse_tool_arguments(&tool_call.function.arguments),
         });
+    }
+
+    let mut stop_reason = choice
+        .finish_reason
+        .map(|value| normalize_finish_reason(&value));
+    if stop_reason.as_deref() == Some("end_turn")
+        && content
+            .iter()
+            .any(|block| matches!(block, OutputContentBlock::ToolUse { .. }))
+    {
+        stop_reason = Some("tool_use".to_string());
     }
 
     Ok(MessageResponse {
@@ -981,9 +1111,7 @@ fn normalize_response(
         role: choice.message.role,
         content,
         model: response.model.if_empty_then(model.to_string()),
-        stop_reason: choice
-            .finish_reason
-            .map(|value| normalize_finish_reason(&value)),
+        stop_reason,
         stop_sequence: None,
         usage: Usage {
             input_tokens: response
@@ -1003,6 +1131,122 @@ fn normalize_response(
 
 fn parse_tool_arguments(arguments: &str) -> Value {
     serde_json::from_str(arguments).unwrap_or_else(|_| json!({ "raw": arguments }))
+}
+
+#[derive(Debug, Default)]
+struct QwenParsedToolCalls {
+    remaining_text: String,
+    calls: Vec<ResponseToolCall>,
+}
+
+fn parse_qwen_textual_tool_calls(text: &str) -> QwenParsedToolCalls {
+    const OPEN: &str = "<tool_call>";
+    const CLOSE: &str = "</tool_call>";
+
+    let mut remaining = String::new();
+    let mut calls = Vec::new();
+    let mut cursor = 0usize;
+
+    while let Some(open_rel) = text[cursor..].find(OPEN) {
+        let open_idx = cursor + open_rel;
+        remaining.push_str(&text[cursor..open_idx]);
+        let block_start = open_idx + OPEN.len();
+        let Some(close_rel) = text[block_start..].find(CLOSE) else {
+            remaining.push_str(&text[open_idx..]);
+            cursor = text.len();
+            break;
+        };
+        let block_end = block_start + close_rel;
+        let block = &text[block_start..block_end];
+        if let Some(call) = parse_qwen_textual_tool_call_block(block, calls.len()) {
+            calls.push(call);
+        } else {
+            remaining.push_str(&text[open_idx..block_end + CLOSE.len()]);
+        }
+        cursor = block_end + CLOSE.len();
+    }
+    if cursor < text.len() {
+        remaining.push_str(&text[cursor..]);
+    }
+
+    QwenParsedToolCalls {
+        remaining_text: remaining.trim().to_string(),
+        calls,
+    }
+}
+
+fn parse_qwen_textual_tool_call_block(block: &str, index: usize) -> Option<ResponseToolCall> {
+    const FUNCTION_PREFIX: &str = "<function=";
+    const FUNCTION_CLOSE: &str = "</function>";
+    const PARAMETER_PREFIX: &str = "<parameter=";
+    const PARAMETER_CLOSE: &str = "</parameter>";
+
+    let function_start = block.find(FUNCTION_PREFIX)?;
+    let function_name_start = function_start + FUNCTION_PREFIX.len();
+    let function_name_end_rel = block[function_name_start..].find('>')?;
+    let function_name_end = function_name_start + function_name_end_rel;
+    let function_name_raw = block[function_name_start..function_name_end].trim();
+    let function_name = function_name_raw
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim()
+        .to_string();
+    if function_name.is_empty() {
+        return None;
+    }
+
+    let body_start = function_name_end + 1;
+    let body_end = block[body_start..]
+        .find(FUNCTION_CLOSE)
+        .map_or(block.len(), |pos| body_start + pos);
+    let body = &block[body_start..body_end];
+
+    let mut input = serde_json::Map::new();
+    let mut cursor = 0usize;
+    while let Some(param_rel) = body[cursor..].find(PARAMETER_PREFIX) {
+        let param_start = cursor + param_rel;
+        let key_start = param_start + PARAMETER_PREFIX.len();
+        let Some(key_end_rel) = body[key_start..].find('>') else {
+            break;
+        };
+        let key_end = key_start + key_end_rel;
+        let key = body[key_start..key_end]
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_string();
+        if key.is_empty() {
+            break;
+        }
+        let value_start = key_end + 1;
+        let Some(value_end_rel) = body[value_start..].find(PARAMETER_CLOSE) else {
+            break;
+        };
+        let value_end = value_start + value_end_rel;
+        let raw_value = &body[value_start..value_end];
+        input.insert(key, qwen_parameter_value(raw_value));
+        cursor = value_end + PARAMETER_CLOSE.len();
+    }
+
+    if input.is_empty() {
+        return None;
+    }
+
+    Some(ResponseToolCall {
+        id: format!("qwen_tool_call_{index}"),
+        function: ResponseToolFunction {
+            name: function_name,
+            arguments: Value::Object(input).to_string(),
+        },
+    })
+}
+
+fn qwen_parameter_value(raw: &str) -> Value {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Value::String(String::new());
+    }
+    serde_json::from_str(trimmed).unwrap_or_else(|_| Value::String(trimmed.to_string()))
 }
 
 fn next_sse_frame(buffer: &mut Vec<u8>) -> Option<String> {
@@ -1247,8 +1491,8 @@ mod tests {
     };
     use crate::error::ApiError;
     use crate::types::{
-        ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, OutputContentBlock,
-        StreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+        ContentBlockDelta, ContentBlockStartEvent, InputContentBlock, InputMessage, MessageRequest,
+        OutputContentBlock, StreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
     };
     use serde_json::json;
     use std::sync::{Mutex, OnceLock};
@@ -1420,6 +1664,82 @@ mod tests {
             json!({"city": "Paris"})
         );
         assert_eq!(parse_tool_arguments("not-json"), json!({"raw": "not-json"}));
+    }
+
+    #[test]
+    fn parses_qwen_textual_tool_call_blocks() {
+        let payload = "I will edit.\n<tool_call><function=edit_file><parameter=path>/tmp/a.py</parameter><parameter=content>print(1)</parameter></function></tool_call>\nDone";
+        let parsed = super::parse_qwen_textual_tool_calls(payload);
+        assert_eq!(parsed.calls.len(), 1, "one tool call should be inferred");
+        assert_eq!(parsed.remaining_text, "I will edit.\n\nDone");
+        assert_eq!(parsed.calls[0].function.name, "edit_file");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&parsed.calls[0].function.arguments)
+                .expect("arguments should be valid json"),
+            json!({"path":"/tmp/a.py","content":"print(1)"})
+        );
+    }
+
+    #[test]
+    fn normalize_response_promotes_qwen_textual_tool_calls_when_native_calls_missing() {
+        let response: super::ChatCompletionResponse = serde_json::from_value(json!({
+            "id": "chatcmpl-qwen-text",
+            "model": "Qwen_Qwen3.5-4B-Q4_K_M.gguf",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "<tool_call><function=glob_search><parameter=path>/repo</parameter><parameter=pattern>**/*.py</parameter></function></tool_call>"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        }))
+        .expect("response json should deserialize");
+
+        let normalized =
+            super::normalize_response("qwen3.5:4b", response).expect("response should normalize");
+        assert_eq!(normalized.stop_reason.as_deref(), Some("tool_use"));
+        assert_eq!(normalized.content.len(), 1);
+        match &normalized.content[0] {
+            OutputContentBlock::ToolUse { name, input, .. } => {
+                assert_eq!(name, "glob_search");
+                assert_eq!(input, &json!({"path":"/repo","pattern":"**/*.py"}));
+            }
+            other => panic!("expected tool_use block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn normalize_response_supports_legacy_function_call_shape() {
+        let response: super::ChatCompletionResponse = serde_json::from_value(json!({
+            "id": "chatcmpl-func",
+            "model": "qwen3.5:4b",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "function_call": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"README.md\"}"
+                    }
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        }))
+        .expect("response json should deserialize");
+
+        let normalized =
+            super::normalize_response("qwen3.5:4b", response).expect("response should normalize");
+        assert_eq!(normalized.stop_reason.as_deref(), Some("tool_use"));
+        assert_eq!(normalized.content.len(), 1);
+        match &normalized.content[0] {
+            OutputContentBlock::ToolUse { name, input, .. } => {
+                assert_eq!(name, "read_file");
+                assert_eq!(input, &json!({"path":"README.md"}));
+            }
+            other => panic!("expected tool_use block, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1689,7 +2009,7 @@ mod tests {
     fn stream_state_emits_text_delta_from_reasoning_content_when_content_missing() {
         let chunk: super::ChatCompletionChunk = serde_json::from_value(json!({
             "id": "chatcmpl-stream-test",
-            "model": "Qwen_Qwen3.5-4B-Q4_K_M.gguf",
+            "model": "gpt-4o-mini",
             "choices": [{
                 "delta": {
                     "reasoning_content": "step-by-step"
@@ -1698,7 +2018,7 @@ mod tests {
         }))
         .expect("chunk json should deserialize");
 
-        let mut state = super::StreamState::new("qwen3.5:4b".to_string());
+        let mut state = super::StreamState::new("gpt-4o-mini".to_string());
         let events = state.ingest_chunk(chunk).expect("chunk should be ingested");
         let reasoning_delta = events.into_iter().any(|event| {
             matches!(
@@ -1714,5 +2034,80 @@ mod tests {
             reasoning_delta,
             "stream should emit text delta from reasoning_content fallback"
         );
+    }
+
+    #[test]
+    fn stream_state_promotes_qwen_textual_tool_calls_from_text_deltas() {
+        let chunk: super::ChatCompletionChunk = serde_json::from_value(json!({
+            "id": "chatcmpl-stream-qwen-text",
+            "model": "Qwen_Qwen3.5-4B-Q4_K_M.gguf",
+            "choices": [{
+                "delta": {
+                    "content": "<tool_call><function=edit_file><parameter=path>/tmp/x.py</parameter></function></tool_call>"
+                },
+                "finish_reason": "stop"
+            }]
+        }))
+        .expect("chunk json should deserialize");
+
+        let mut state = super::StreamState::new("qwen3.5:4b".to_string());
+        let chunk_events = state.ingest_chunk(chunk).expect("chunk should be ingested");
+        assert!(
+            chunk_events
+                .iter()
+                .all(|event| !matches!(event, StreamEvent::ContentBlockDelta(_))),
+            "qwen text should be buffered until finish"
+        );
+
+        let finish_events = state.finish().expect("finish should succeed");
+        let saw_tool_start = finish_events.iter().any(|event| {
+            matches!(
+                event,
+                StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                    content_block: OutputContentBlock::ToolUse { name, .. },
+                    ..
+                }) if name == "edit_file"
+            )
+        });
+        assert!(saw_tool_start, "finish should emit inferred tool call");
+        let saw_tool_stop_reason = finish_events.iter().any(|event| {
+            matches!(
+                event,
+                StreamEvent::MessageDelta(delta)
+                    if delta.delta.stop_reason.as_deref() == Some("tool_use")
+            )
+        });
+        assert!(saw_tool_stop_reason, "stop reason should become tool_use");
+    }
+
+    #[test]
+    fn stream_state_supports_legacy_function_call_deltas() {
+        let chunk: super::ChatCompletionChunk = serde_json::from_value(json!({
+            "id": "chatcmpl-stream-func",
+            "model": "qwen3.5:4b",
+            "choices": [{
+                "delta": {
+                    "function_call": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"README.md\"}"
+                    }
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .expect("chunk json should deserialize");
+
+        let mut state = super::StreamState::new("qwen3.5:4b".to_string());
+        let events = state.ingest_chunk(chunk).expect("chunk should be ingested");
+        let saw_tool_start = events.iter().any(|event| {
+            matches!(
+                event,
+                StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                    content_block: OutputContentBlock::ToolUse { name, .. },
+                    ..
+                }) if name == "read_file"
+            )
+        });
+        assert!(saw_tool_start, "legacy function_call should map to tool_use");
     }
 }

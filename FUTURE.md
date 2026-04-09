@@ -37,12 +37,13 @@ Last updated: 2026-04-09
   - measurable improvement in multi-file task success in retrieval-enabled rerun
 - Current state (2026-04-09 baseline run):
   - stream-content fatal failures met target (`0/8`)
-  - task-success target missed (`1/8` successful target edits in task worktrees)
+  - baseline task-success target missed (`1/8` successful target edits in task worktrees)
+  - post-compat task-success still below target (`3/8` strict successful target edits in task worktrees)
   - retrieval A/B blocked until baseline no-op/path-targeting failures are reduced
 - Immediate follow-up focus:
-  - harden prompt/workspace targeting behavior for absolute repo paths
-  - address output text space-collapse degradation in local-qwen rendering path
-  - rerun the same 8-task ladder before enabling retrieval experiment phase
+  - add guardrails for whitespace-collapsed write/edit payloads from local Qwen tool calls
+  - add stricter timeout/no-progress handling for multi-step wandering tool loops
+  - keep rerunning the same 8-task ladder until strict target-edit success reaches acceptance threshold before retrieval A/B phase
 
 1. Tune loop budgets for overnight stability
 - Keep new loop-profile controls stable (`normal`/`light`/`aggressive`/`auto`).

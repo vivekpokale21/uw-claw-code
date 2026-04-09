@@ -106,6 +106,19 @@ Last updated: 2026-04-09
 - Capability gate result:
   - baseline failed acceptance threshold
   - retrieval A/B is deferred until baseline reliability is improved
+- Qwen compatibility hardening execution (Rust provider path):
+  - implemented Qwen textual tool-call promotion for OpenAI-compatible responses:
+    - non-stream normalization path (`<tool_call><function=...><parameter=...>`)
+    - stream finish-time promotion from buffered text deltas
+  - implemented legacy `function_call` fallback handling for both streaming and non-streaming payloads
+  - added Rust regression coverage for Qwen textual tool-call and legacy function-call compatibility
+  - post-patch ladder execution artifact root: `/tmp/qwen_matrix_postpatch_2026-04-09`
+  - post-patch stream-content fatal failures: `0/8`
+  - post-patch strict successful target edits (all requested files/behaviors complete): `3/8`
+  - residual failures after compatibility patch:
+    - timeout-prone wandering tool loops on multi-step tasks
+    - partial edits that stop before full task completion
+    - whitespace-collapsed tool payloads causing destructive code formatting in some write paths
 
 ## Current Status
 
