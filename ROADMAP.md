@@ -28,6 +28,15 @@
 - 2026-04-09 — Slice 6 complete:
   - Added tool-level Rust regression coverage for persisted LSP health state output/path updates.
   - Migration docs now explicitly mark Python runtime behavior as compatibility fallback while Rust remains the primary AFK path.
+- 2026-04-09 — Capability-first validation track started:
+  - Qwen local-runtime benchmarking is now prioritized ahead of UI redesign.
+  - Progressive edit/test ladder is being run on external dataset repos to capture capability baselines.
+  - Retrieval is planned as a follow-up A/B phase (baseline first, then embedding-index rerun).
+- 2026-04-09 — Capability baseline run completed (8-task ladder):
+  - stream-content crash class stayed fixed (`assistant stream produced no content`: `0/8`).
+  - edit reliability failed baseline gate (`1/8` successful target edits in isolated worktrees).
+  - dominant issues were no-op/pseudo-tool-call completions, path targeting confusion, and degraded output text readability.
+  - retrieval A/B phase is deferred until baseline capability reliability improves.
 
 ## Goal
 

@@ -80,6 +80,33 @@ Last updated: 2026-04-09
   - Python path is compatibility-only where parity is incomplete
   - no new Python-first AFK feature development unless Rust path is blocked
 
+## Capability Benchmark Track (2026-04-09)
+
+- Started a capability-first validation track for local Qwen (`qwen3.5:4b`) on external repos used as test datasets.
+- Decision locked: prioritize model/harness capability benchmarking before UI redesign work.
+- Benchmark protocol uses a progressive edit/test ladder and captures:
+  - stream/content failure rate
+  - edit correctness and scope discipline
+  - verification pass rate on touched modules
+- Retrieval sequencing locked to baseline-first A/B:
+  - run baseline ladder without embedding retrieval
+  - add retrieval path (planned `nomic-embed-text` style embedding index)
+  - rerun the same ladder and compare outcomes
+- Stream crash regression status:
+  - known `assistant stream produced no content` path fixed in `938dfee`
+  - fix accepts OpenAI-compatible `reasoning_content` fallback for non-stream and streaming payloads
+- Baseline ladder execution (8 tasks, external dataset repo worktrees):
+  - corrected run artifact root: `/tmp/qwen_matrix_baseline_2026-04-09_cwd`
+  - stream-content fatal failures: `0/8`
+  - target-task successful code edits in target worktrees: `1/8`
+  - common failure modes observed:
+    - output text formatting collapse (space-stripped prose blocks)
+    - path/workspace confusion despite explicit repo path in prompt
+    - pseudo tool-call text emission without completing concrete edits
+- Capability gate result:
+  - baseline failed acceptance threshold
+  - retrieval A/B is deferred until baseline reliability is improved
+
 ## Current Status
 
 Slice 6 of Claude Code workflow reconstruction for AFK reliability is now implemented on top of

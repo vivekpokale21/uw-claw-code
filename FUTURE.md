@@ -21,6 +21,29 @@ Last updated: 2026-04-09
 
 ## P0 — AFK Reliability Core
 
+0. Capability benchmark ladder + retrieval A/B for local Qwen
+- Run a progressive edit/test capability ladder on external dataset repos (not product repos) to measure real coding reliability beyond simple single-file tasks.
+- Keep runtime fixed (`qwen3.5:4b`, local OpenAI-compatible endpoint) and compare:
+  - baseline (no embedding retrieval)
+  - retrieval-enabled path (embedding index, planned with `nomic-embed-text` class model)
+- Track failures by class:
+  - stream/content failures
+  - malformed output text formatting
+  - incorrect/over-scoped edits
+  - verification failures on touched files
+- Acceptance criteria:
+  - zero stream-content fatal failures in ladder run
+  - >= 75% task success at target difficulty
+  - measurable improvement in multi-file task success in retrieval-enabled rerun
+- Current state (2026-04-09 baseline run):
+  - stream-content fatal failures met target (`0/8`)
+  - task-success target missed (`1/8` successful target edits in task worktrees)
+  - retrieval A/B blocked until baseline no-op/path-targeting failures are reduced
+- Immediate follow-up focus:
+  - harden prompt/workspace targeting behavior for absolute repo paths
+  - address output text space-collapse degradation in local-qwen rendering path
+  - rerun the same 8-task ladder before enabling retrieval experiment phase
+
 1. Tune loop budgets for overnight stability
 - Keep new loop-profile controls stable (`normal`/`light`/`aggressive`/`auto`).
 - Calibrate per-repo defaults for:
