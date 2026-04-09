@@ -435,7 +435,7 @@ impl StreamState {
         }
 
         for choice in chunk.choices {
-            if let Some(content) = choice.delta.content.filter(|value| !value.is_empty()) {
+            if let Some(content) = delta_text_content(&choice.delta) {
                 if !self.text_started {
                     self.text_started = true;
                     events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
@@ -632,6 +632,10 @@ struct ChatMessage {
     #[serde(default)]
     content: Option<String>,
     #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<Value>,
+    #[serde(default)]
     tool_calls: Vec<ResponseToolCall>,
 }
 
@@ -677,6 +681,10 @@ struct ChunkChoice {
 struct ChunkDelta {
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<Value>,
     #[serde(default)]
     tool_calls: Vec<DeltaToolCall>,
 }
@@ -956,7 +964,7 @@ fn normalize_response(
             "chat completion response missing choices",
         ))?;
     let mut content = Vec::new();
-    if let Some(text) = choice.message.content.filter(|value| !value.is_empty()) {
+    if let Some(text) = message_text_content(&choice.message) {
         content.push(OutputContentBlock::Text { text });
     }
     for tool_call in choice.message.tool_calls {
@@ -1177,6 +1185,59 @@ impl StringExt for String {
     }
 }
 
+fn first_non_empty_text(candidates: impl IntoIterator<Item = Option<String>>) -> Option<String> {
+    candidates
+        .into_iter()
+        .flatten()
+        .map(|value| value.trim().to_string())
+        .find(|value| !value.is_empty())
+}
+
+fn reasoning_value_to_text(value: Option<&Value>) -> Option<String> {
+    match value {
+        Some(Value::String(text)) if !text.trim().is_empty() => Some(text.trim().to_string()),
+        Some(Value::Array(items)) => {
+            let joined = items
+                .iter()
+                .filter_map(|item| match item {
+                    Value::String(text) => Some(text.trim().to_string()),
+                    Value::Object(object) => object
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .or_else(|| object.get("content").and_then(Value::as_str))
+                        .map(str::trim)
+                        .map(ToString::to_string),
+                    _ => None,
+                })
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if joined.is_empty() {
+                None
+            } else {
+                Some(joined)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn message_text_content(message: &ChatMessage) -> Option<String> {
+    first_non_empty_text([
+        message.content.clone(),
+        message.reasoning_content.clone(),
+        reasoning_value_to_text(message.reasoning.as_ref()),
+    ])
+}
+
+fn delta_text_content(delta: &ChunkDelta) -> Option<String> {
+    first_non_empty_text([
+        delta.content.clone(),
+        delta.reasoning_content.clone(),
+        reasoning_value_to_text(delta.reasoning.as_ref()),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1186,8 +1247,8 @@ mod tests {
     };
     use crate::error::ApiError;
     use crate::types::{
-        InputContentBlock, InputMessage, MessageRequest, ToolChoice, ToolDefinition,
-        ToolResultContentBlock,
+        ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, OutputContentBlock,
+        StreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
     };
     use serde_json::json;
     use std::sync::{Mutex, OnceLock};
@@ -1592,6 +1653,66 @@ mod tests {
         assert!(
             payload.get("max_completion_tokens").is_none(),
             "gpt-4o must not emit max_completion_tokens"
+        );
+    }
+
+    #[test]
+    fn normalize_response_uses_reasoning_content_when_text_content_is_empty() {
+        let response: super::ChatCompletionResponse = serde_json::from_value(json!({
+            "id": "chatcmpl-test",
+            "model": "Qwen_Qwen3.5-4B-Q4_K_M.gguf",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "FINAL ANSWER: ready"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 4
+            }
+        }))
+        .expect("response json should deserialize");
+
+        let normalized =
+            super::normalize_response("qwen3.5:4b", response).expect("response should normalize");
+        assert_eq!(normalized.content.len(), 1, "fallback text should be emitted");
+        match &normalized.content[0] {
+            OutputContentBlock::Text { text } => assert_eq!(text, "FINAL ANSWER: ready"),
+            other => panic!("expected text content block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_state_emits_text_delta_from_reasoning_content_when_content_missing() {
+        let chunk: super::ChatCompletionChunk = serde_json::from_value(json!({
+            "id": "chatcmpl-stream-test",
+            "model": "Qwen_Qwen3.5-4B-Q4_K_M.gguf",
+            "choices": [{
+                "delta": {
+                    "reasoning_content": "step-by-step"
+                }
+            }]
+        }))
+        .expect("chunk json should deserialize");
+
+        let mut state = super::StreamState::new("qwen3.5:4b".to_string());
+        let events = state.ingest_chunk(chunk).expect("chunk should be ingested");
+        let reasoning_delta = events.into_iter().any(|event| {
+            matches!(
+                event,
+                StreamEvent::ContentBlockDelta(delta_event)
+                    if matches!(
+                        delta_event.delta,
+                        ContentBlockDelta::TextDelta { ref text } if text == "step-by-step"
+                    )
+            )
+        });
+        assert!(
+            reasoning_delta,
+            "stream should emit text delta from reasoning_content fallback"
         );
     }
 }
