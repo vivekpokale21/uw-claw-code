@@ -2967,6 +2967,21 @@ fn run_resume_command(
             message: Some(render_doctor_report()?.render()),
             json: None,
         }),
+        SlashCommand::Stats => {
+            let usage = UsageTracker::from_session(session).cumulative_usage();
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(format_cost_report(usage)),
+                json: Some(serde_json::json!({
+                    "kind": "stats",
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                    "cache_read_input_tokens": usage.cache_read_input_tokens,
+                    "total_tokens": usage.total_tokens(),
+                })),
+            })
+        }
         SlashCommand::History { count } => {
             let limit = parse_history_count(count.as_deref())
                 .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
@@ -2997,7 +3012,6 @@ fn run_resume_command(
         | SlashCommand::Logout
         | SlashCommand::Vim
         | SlashCommand::Upgrade
-        | SlashCommand::Stats
         | SlashCommand::Share
         | SlashCommand::Feedback
         | SlashCommand::Files
@@ -4076,11 +4090,15 @@ impl LiveCli {
                 self.print_prompt_history(count.as_deref());
                 false
             }
+            SlashCommand::Stats => {
+                let usage = UsageTracker::from_session(self.runtime.session()).cumulative_usage();
+                println!("{}", format_cost_report(usage));
+                false
+            }
             SlashCommand::Login
             | SlashCommand::Logout
             | SlashCommand::Vim
             | SlashCommand::Upgrade
-            | SlashCommand::Stats
             | SlashCommand::Share
             | SlashCommand::Feedback
             | SlashCommand::Files
