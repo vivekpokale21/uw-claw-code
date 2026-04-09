@@ -2989,14 +2989,19 @@ fn run_resume_command(
         SlashCommand::Export { path } => {
             let export_path = resolve_export_path(path.as_deref(), session)?;
             fs::write(&export_path, render_export_text(session))?;
+            let msg_count = session.messages.len();
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(format!(
                     "Export\n  Result           wrote transcript\n  File             {}\n  Messages         {}",
                     export_path.display(),
-                    session.messages.len(),
+                    msg_count,
                 )),
-                json: None,
+                json: Some(serde_json::json!({
+                    "kind": "export",
+                    "file": export_path.display().to_string(),
+                    "message_count": msg_count,
+                })),
             })
         }
         SlashCommand::Agents { args } => {
@@ -3004,7 +3009,10 @@ fn run_resume_command(
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(handle_agents_slash_command(args.as_deref(), &cwd)?),
-                json: None,
+                json: Some(serde_json::json!({
+                    "kind": "agents",
+                    "text": handle_agents_slash_command(args.as_deref(), &cwd)?,
+                })),
             })
         }
         SlashCommand::Skills { args } => {
