@@ -24,39 +24,39 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
-    detect_provider_kind, oauth_token_is_expired, resolve_startup_auth_source, AnthropicClient,
-    AuthSource, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
-    MessageResponse, OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient,
-    ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
-    ToolResultContentBlock,
+    AnthropicClient, AuthSource, ContentBlockDelta, InputContentBlock, InputMessage,
+    MessageRequest, MessageResponse, OutputContentBlock, PromptCache,
+    ProviderClient as ApiProviderClient, ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice,
+    ToolDefinition, ToolResultContentBlock, detect_provider_kind, oauth_token_is_expired,
+    resolve_startup_auth_source,
 };
 
 use commands::{
-    classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
-    handle_mcp_slash_command, handle_mcp_slash_command_json, handle_plugins_slash_command,
-    handle_skills_slash_command, handle_skills_slash_command_json, render_slash_command_help,
-    render_slash_command_help_filtered, resolve_skill_invocation, resume_supported_slash_commands,
-    slash_command_specs, validate_slash_command_input, SkillSlashDispatch, SlashCommand,
+    SkillSlashDispatch, SlashCommand, classify_skills_slash_command, handle_agents_slash_command,
+    handle_agents_slash_command_json, handle_mcp_slash_command, handle_mcp_slash_command_json,
+    handle_plugins_slash_command, handle_skills_slash_command, handle_skills_slash_command_json,
+    render_slash_command_help, render_slash_command_help_filtered, resolve_skill_invocation,
+    resume_supported_slash_commands, slash_command_specs, validate_slash_command_input,
 };
-use compat_harness::{extract_manifest, UpstreamPaths};
+use compat_harness::{UpstreamPaths, extract_manifest};
 use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
-    check_base_commit, clear_oauth_credentials, format_stale_base_warning, format_usd,
-    generate_pkce_pair, generate_state, load_oauth_credentials, load_system_prompt,
+    ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource,
+    ContentBlock, ConversationMessage, ConversationRuntime, McpServer, McpServerManager,
+    McpServerSpec, McpTool, MessageRole, ModelPricing, OAuthAuthorizationRequest, OAuthConfig,
+    OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent,
+    ResolvedPermissionMode, RuntimeError, Session, TokenUsage, ToolError, ToolExecutor,
+    UsageTracker, check_base_commit, clear_oauth_credentials, format_stale_base_warning,
+    format_usd, generate_pkce_pair, generate_state, load_oauth_credentials, load_system_prompt,
     parse_oauth_callback_request_target, pricing_for_model, resolve_expected_base,
-    resolve_sandbox_status, save_oauth_credentials, ApiClient, ApiRequest, AssistantEvent,
-    CompactionConfig, ConfigLoader, ConfigSource, ContentBlock, ConversationMessage,
-    ConversationRuntime, McpServer, McpServerManager, McpServerSpec, McpTool, MessageRole,
-    ModelPricing, OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest,
-    PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode,
-    RuntimeError, Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
+    resolve_sandbox_status, save_oauth_credentials,
 };
 use serde::Deserialize;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use tools::{
-    execute_tool, mvp_tool_specs, GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput,
+    GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput, execute_tool, mvp_tool_specs,
 };
 
 const DEFAULT_MODEL: &str = "qwen3.5:4b";
@@ -79,6 +79,7 @@ const BUILD_TARGET: Option<&str> = option_env!("TARGET");
 const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
 const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_CHECKPOINT_LIST_LIMIT: usize = 20;
 const PRIMARY_SESSION_EXTENSION: &str = "jsonl";
 const LEGACY_SESSION_EXTENSION: &str = "json";
 const LATEST_SESSION_REFERENCE: &str = "latest";
@@ -557,7 +558,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 index += 1;
             }
             other if rest.is_empty() && other.starts_with('-') => {
-                return Err(format_unknown_option(other))
+                return Err(format_unknown_option(other));
             }
             other => {
                 rest.push(other.to_string());
@@ -1751,10 +1752,12 @@ fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck {
         ("cwd".to_string(), json!(context.cwd.display().to_string())),
         (
             "project_root".to_string(),
-            json!(context
-                .project_root
-                .as_ref()
-                .map(|path| path.display().to_string())),
+            json!(
+                context
+                    .project_root
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+            ),
         ),
         ("in_git_repo".to_string(), json!(in_repo)),
         ("git_branch".to_string(), json!(context.git_branch)),
@@ -2419,6 +2422,27 @@ fn format_cost_report(usage: TokenUsage) -> String {
     )
 }
 
+fn format_budget_report(model: &str, usage: StatusUsage, permission_mode: &str) -> String {
+    let max_tokens = usize::try_from(max_tokens_for_model(model)).unwrap_or(usize::MAX);
+    let remaining_tokens = max_tokens.saturating_sub(usage.estimated_tokens);
+    format!(
+        "Budget
+  Model            {model}
+  Permission mode  {permission_mode}
+  Messages         {}
+  Turns            {}
+  Context estimate {}
+  Max context      {}
+  Remaining        {}
+
+Usage
+  Compact now      /compact
+  Inspect status   /status
+  Inspect cost     /cost",
+        usage.message_count, usage.turns, usage.estimated_tokens, max_tokens, remaining_tokens,
+    )
+}
+
 fn format_resume_report(session_path: &str, message_count: usize, turns: u32) -> String {
     format!(
         "Session resumed
@@ -2661,6 +2685,25 @@ fn run_resume_command(
                 )),
             })
         }
+        SlashCommand::Budget => {
+            let tracker = UsageTracker::from_session(session);
+            let usage = tracker.cumulative_usage();
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(format_budget_report(
+                    "restored-session",
+                    StatusUsage {
+                        message_count: session.messages.len(),
+                        turns: tracker.turns(),
+                        latest: tracker.current_turn_usage(),
+                        cumulative: usage,
+                        estimated_tokens: 0,
+                    },
+                    default_permission_mode().as_str(),
+                )),
+                json: None,
+            })
+        }
         SlashCommand::Sandbox => {
             let cwd = env::current_dir()?;
             let loader = ConfigLoader::default_for(&cwd);
@@ -2784,6 +2827,9 @@ fn run_resume_command(
         | SlashCommand::Resume { .. }
         | SlashCommand::Model { .. }
         | SlashCommand::Permissions { .. }
+        | SlashCommand::Checkpoint { .. }
+        | SlashCommand::ListRuns { .. }
+        | SlashCommand::ShowRun { .. }
         | SlashCommand::Session { .. }
         | SlashCommand::Plugins { .. }
         | SlashCommand::Login
@@ -2871,7 +2917,7 @@ fn run_repl(
                     cli.persist_session()?;
                     break;
                 }
-                match SlashCommand::parse(&trimmed) {
+                match parse_repl_slash_command(&trimmed) {
                     Ok(Some(command)) => {
                         if cli.handle_repl_command(command)? {
                             cli.persist_session()?;
@@ -2919,6 +2965,15 @@ fn run_repl(
     Ok(())
 }
 
+fn parse_repl_slash_command(
+    input: &str,
+) -> Result<Option<SlashCommand>, commands::SlashCommandParseError> {
+    match SlashCommand::parse(input) {
+        Ok(Some(SlashCommand::Unknown(_))) => Ok(None),
+        parsed => parsed,
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SessionHandle {
     id: String,
@@ -2933,6 +2988,18 @@ struct ManagedSessionSummary {
     message_count: usize,
     parent_session_id: Option<String>,
     branch_name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct AutonomousCheckpointSummary {
+    run_id: String,
+    status: String,
+    stop_reason: String,
+    phase: String,
+    iterations: i64,
+    max_iter: i64,
+    path: PathBuf,
+    updated_unix: u64,
 }
 
 struct LiveCli {
@@ -3665,6 +3732,10 @@ impl LiveCli {
                 self.print_status();
                 false
             }
+            SlashCommand::Budget => {
+                self.print_budget();
+                false
+            }
             SlashCommand::Bughunter { scope } => {
                 self.run_bughunter(scope.as_deref())?;
                 false
@@ -3709,6 +3780,18 @@ impl LiveCli {
                 false
             }
             SlashCommand::Resume { session_path } => self.resume_session(session_path)?,
+            SlashCommand::Checkpoint { action, target } => {
+                self.run_checkpoint(action.as_deref(), target.as_deref())?;
+                false
+            }
+            SlashCommand::ListRuns { limit } => {
+                self.run_list_runs(limit.as_deref())?;
+                false
+            }
+            SlashCommand::ShowRun { run_id } => {
+                self.run_show_run(run_id.as_deref())?;
+                false
+            }
             SlashCommand::Config { section } => {
                 Self::print_config(section.as_deref())?;
                 false
@@ -4041,6 +4124,25 @@ impl LiveCli {
         println!("{}", format_cost_report(cumulative));
     }
 
+    fn print_budget(&self) {
+        let cumulative = self.runtime.usage().cumulative_usage();
+        let latest = self.runtime.usage().current_turn_usage();
+        println!(
+            "{}",
+            format_budget_report(
+                &self.model,
+                StatusUsage {
+                    message_count: self.runtime.session().messages.len(),
+                    turns: self.runtime.usage().turns(),
+                    latest,
+                    cumulative,
+                    estimated_tokens: self.runtime.estimated_tokens(),
+                },
+                self.permission_mode.as_str(),
+            )
+        );
+    }
+
     fn resume_session(
         &mut self,
         session_path: Option<String>,
@@ -4321,6 +4423,55 @@ impl LiveCli {
                 Ok(false)
             }
         }
+    }
+
+    fn run_checkpoint(
+        &self,
+        action: Option<&str>,
+        target: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        match action {
+            None => self.run_list_runs(None)?,
+            Some("list") => {
+                self.run_list_runs(target)?;
+            }
+            Some("-h" | "--help" | "help") => {
+                println!(
+                    "Checkpoint\n  Usage            /checkpoint [list|<run-id>|list <limit>]\n  Directory        <git-root>/.port_sessions"
+                );
+            }
+            Some(run_id) if target.is_none() => {
+                self.run_show_run(Some(run_id))?;
+            }
+            Some(_) => {
+                println!("Usage: /checkpoint [list|<run-id>|list <limit>]");
+            }
+        }
+        Ok(())
+    }
+
+    fn run_list_runs(&self, limit: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+        let resolved_limit = match limit {
+            Some(raw) => match parse_checkpoint_limit(raw) {
+                Ok(value) => value,
+                Err(message) => {
+                    println!("{message}");
+                    return Ok(());
+                }
+            },
+            None => DEFAULT_CHECKPOINT_LIST_LIMIT,
+        };
+        println!("{}", render_checkpoint_list(resolved_limit)?);
+        Ok(())
+    }
+
+    fn run_show_run(&self, run_id: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(run_id) = run_id.filter(|value| !value.trim().is_empty()) else {
+            println!("Usage: /show-run <run-id>");
+            return Ok(());
+        };
+        println!("{}", render_checkpoint_detail(run_id)?);
+        Ok(())
     }
 
     fn handle_plugins_command(
@@ -4669,6 +4820,140 @@ fn format_no_managed_sessions() -> String {
     format!(
         "no managed sessions found in .claw/sessions/\nStart `claw` to create a session, then rerun with `--resume {LATEST_SESSION_REFERENCE}`."
     )
+}
+
+fn checkpoint_repo_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    Ok(find_git_root_in(&cwd).unwrap_or(cwd))
+}
+
+fn checkpoint_dir(repo_root: &Path) -> PathBuf {
+    repo_root.join(".port_sessions")
+}
+
+fn parse_checkpoint_limit(raw: &str) -> Result<usize, String> {
+    let value = raw.trim().parse::<usize>().map_err(|_| {
+        "Invalid limit. Usage: /checkpoint [list|<run-id>|list <limit>]".to_string()
+    })?;
+    if value == 0 {
+        return Err("Invalid limit. Usage: /checkpoint [list|<run-id>|list <limit>]".to_string());
+    }
+    Ok(value)
+}
+
+fn list_autonomous_checkpoints(
+    repo_root: &Path,
+    limit: usize,
+) -> Result<Vec<AutonomousCheckpointSummary>, Box<dyn std::error::Error>> {
+    let directory = checkpoint_dir(repo_root);
+    if !directory.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut summaries = Vec::new();
+    for entry in fs::read_dir(&directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !file_name.starts_with("autonomous_") || !file_name.ends_with(".json") {
+            continue;
+        }
+        let modified_unix = entry
+            .metadata()?
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |duration| duration.as_secs());
+        let payload = match fs::read_to_string(&path)
+            .ok()
+            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+        {
+            Some(value) if value.is_object() => value,
+            _ => continue,
+        };
+        summaries.push(AutonomousCheckpointSummary {
+            run_id: payload
+                .get("run_id")
+                .and_then(|value| value.as_str())
+                .map_or_else(
+                    || {
+                        file_name
+                            .strip_prefix("autonomous_")
+                            .unwrap_or(file_name)
+                            .trim_end_matches(".json")
+                            .to_string()
+                    },
+                    ToOwned::to_owned,
+                ),
+            status: payload
+                .get("status")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown")
+                .to_string(),
+            stop_reason: payload
+                .get("stop_reason")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown")
+                .to_string(),
+            phase: payload
+                .get("phase")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown")
+                .to_string(),
+            iterations: payload
+                .get("iterations")
+                .and_then(|value| value.as_i64())
+                .unwrap_or_default(),
+            max_iter: payload
+                .get("max_iter")
+                .and_then(|value| value.as_i64())
+                .unwrap_or_default(),
+            path: path.clone(),
+            updated_unix: modified_unix,
+        });
+    }
+
+    summaries.sort_by(|left, right| right.updated_unix.cmp(&left.updated_unix));
+    summaries.truncate(limit.max(1));
+    Ok(summaries)
+}
+
+fn render_checkpoint_list(limit: usize) -> Result<String, Box<dyn std::error::Error>> {
+    let repo_root = checkpoint_repo_root()?;
+    let rows = list_autonomous_checkpoints(&repo_root, limit)?;
+    let mut lines = vec![format!("Checkpoint files: {}", rows.len()), String::new()];
+    if rows.is_empty() {
+        lines.push("No autonomous checkpoints found.".to_string());
+        return Ok(lines.join("\n"));
+    }
+    lines.push("run_id\tstatus\tstop_reason\tphase\titerations\tpath".to_string());
+    for item in rows {
+        lines.push(format!(
+            "{}\t{}\t{}\t{}\t{}/{}\t{}",
+            item.run_id,
+            item.status,
+            item.stop_reason,
+            item.phase,
+            item.iterations,
+            item.max_iter,
+            item.path.display()
+        ));
+    }
+    Ok(lines.join("\n"))
+}
+
+fn render_checkpoint_detail(run_id: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let repo_root = checkpoint_repo_root()?;
+    let path = checkpoint_dir(&repo_root).join(format!("autonomous_{}.json", run_id.trim()));
+    if !path.exists() {
+        return Ok(format!("Checkpoint not found: {}", path.display()));
+    }
+    let payload = fs::read_to_string(&path)?;
+    let parsed = serde_json::from_str::<serde_json::Value>(&payload)
+        .map_err(|error| format!("Invalid checkpoint format: {} ({error})", path.display()))?;
+    Ok(serde_json::to_string_pretty(&parsed)?)
 }
 
 fn render_session_list(active_session_id: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -6157,10 +6442,12 @@ impl InternalPromptProgressRun {
 
         let (heartbeat_stop, heartbeat_rx) = mpsc::channel();
         let heartbeat_reporter = reporter.clone();
-        let heartbeat_handle = thread::spawn(move || loop {
-            match heartbeat_rx.recv_timeout(INTERNAL_PROGRESS_HEARTBEAT_INTERVAL) {
-                Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
-                Err(RecvTimeoutError::Timeout) => heartbeat_reporter.emit_heartbeat(),
+        let heartbeat_handle = thread::spawn(move || {
+            loop {
+                match heartbeat_rx.recv_timeout(INTERNAL_PROGRESS_HEARTBEAT_INTERVAL) {
+                    Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                    Err(RecvTimeoutError::Timeout) => heartbeat_reporter.emit_heartbeat(),
+                }
             }
         });
 
@@ -7920,7 +8207,10 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "  --dangerously-skip-permissions  Skip all permission checks"
     )?;
-    writeln!(out, "  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)")?;
+    writeln!(
+        out,
+        "  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)"
+    )?;
     writeln!(
         out,
         "  --version, -V              Print version and build information locally"
@@ -7999,6 +8289,9 @@ fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
 #[cfg(test)]
 mod tests {
     use super::{
+        CliAction, CliOutputFormat, CliToolExecutor, DEFAULT_MODEL, GitWorkspaceSummary,
+        InternalPromptProgressEvent, InternalPromptProgressState, LATEST_SESSION_REFERENCE,
+        LiveCli, LocalHelpTopic, PromptHistoryEntry, STUB_COMMANDS, SlashCommand, StatusUsage,
         build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
         collect_session_prompt_history, create_managed_session_handle, describe_tool_progress,
         filter_tool_specs, format_bughunter_report, format_commit_preflight_report,
@@ -8011,25 +8304,22 @@ mod tests {
         format_unknown_slash_command_message, format_user_visible_api_error,
         merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
         parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
-        parse_history_count, permission_policy, print_help_to, push_output_block,
-        render_config_report, render_diff_report, render_diff_report_for, render_memory_report,
-        render_prompt_history_report, render_repl_help, render_resume_usage,
+        parse_history_count, parse_repl_slash_command, permission_policy, print_help_to,
+        push_output_block, render_config_report, render_diff_report, render_diff_report_for,
+        render_memory_report, render_prompt_history_report, render_repl_help, render_resume_usage,
         render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
         resolve_repl_model, resolve_session_reference, response_to_events,
         resume_supported_slash_commands, run_resume_command, short_tool_id,
         slash_command_completion_candidates_with_sessions, status_context,
-        summarize_tool_payload_for_markdown, validate_no_args, write_mcp_server_fixture, CliAction,
-        CliOutputFormat, CliToolExecutor, GitWorkspaceSummary, InternalPromptProgressEvent,
-        InternalPromptProgressState, LiveCli, LocalHelpTopic, PromptHistoryEntry, SlashCommand,
-        StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
+        summarize_tool_payload_for_markdown, validate_no_args, write_mcp_server_fixture,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
         PluginManager, PluginManagerConfig, PluginTool, PluginToolDefinition, PluginToolPermission,
     };
     use runtime::{
-        load_oauth_credentials, save_oauth_credentials, AssistantEvent, ConfigLoader, ContentBlock,
-        ConversationMessage, MessageRole, OAuthConfig, PermissionMode, Session, ToolExecutor,
+        AssistantEvent, ConfigLoader, ContentBlock, ConversationMessage, MessageRole, OAuthConfig,
+        PermissionMode, Session, ToolExecutor, load_oauth_credentials, save_oauth_credentials,
     };
     use serde_json::json;
     use std::fs;
@@ -9623,7 +9913,11 @@ mod tests {
         assert!(help.contains("/permissions [read-only|workspace-write|danger-full-access]"));
         assert!(help.contains("/clear [--confirm]"));
         assert!(help.contains("/cost"));
+        assert!(help.contains("/budget"));
         assert!(help.contains("/resume <session-path>"));
+        assert!(help.contains("/checkpoint [list|<run-id>|list <limit>]"));
+        assert!(help.contains("/list-runs [limit]"));
+        assert!(help.contains("/show-run <run-id>"));
         assert!(help.contains("/config [env|hooks|model|plugins]"));
         assert!(help.contains("/mcp [list|show <server>|help]"));
         assert!(help.contains("/memory"));
@@ -9937,16 +10231,22 @@ mod tests {
         assert!(preflight.contains("Result           ready"));
         assert!(preflight.contains("Branch           feature/ux"));
         assert!(preflight.contains("Workspace        dirty · 2 files · 1 staged, 1 unstaged"));
-        assert!(preflight
-            .contains("Action           create a git commit from the current workspace changes"));
+        assert!(
+            preflight.contains(
+                "Action           create a git commit from the current workspace changes"
+            )
+        );
     }
 
     #[test]
     fn commit_skipped_report_points_to_next_steps() {
         let report = format_commit_skipped_report();
         assert!(report.contains("Reason           no workspace changes"));
-        assert!(report
-            .contains("Action           create a git commit from the current workspace changes"));
+        assert!(
+            report.contains(
+                "Action           create a git commit from the current workspace changes"
+            )
+        );
         assert!(report.contains("/status to inspect context"));
         assert!(report.contains("/diff to inspect repo changes"));
     }
@@ -10202,6 +10502,29 @@ UU conflicted.rs",
             }))
         );
         assert_eq!(
+            SlashCommand::parse("/budget"),
+            Ok(Some(SlashCommand::Budget))
+        );
+        assert_eq!(
+            SlashCommand::parse("/checkpoint list 5"),
+            Ok(Some(SlashCommand::Checkpoint {
+                action: Some("list".to_string()),
+                target: Some("5".to_string()),
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/list-runs 4"),
+            Ok(Some(SlashCommand::ListRuns {
+                limit: Some("4".to_string()),
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/show-run run-123"),
+            Ok(Some(SlashCommand::ShowRun {
+                run_id: Some("run-123".to_string()),
+            }))
+        );
+        assert_eq!(
             SlashCommand::parse("/clear --confirm"),
             Ok(Some(SlashCommand::Clear { confirm: true }))
         );
@@ -10226,6 +10549,38 @@ UU conflicted.rs",
                 action: Some("fork".to_string()),
                 target: Some("incident-review".to_string())
             }))
+        );
+    }
+
+    #[test]
+    fn repl_slash_parser_ignores_unknown_commands_for_prompt_passthrough() {
+        assert_eq!(
+            parse_repl_slash_command("/status"),
+            Ok(Some(SlashCommand::Status))
+        );
+        assert_eq!(
+            parse_repl_slash_command("/checkpoint list"),
+            Ok(Some(SlashCommand::Checkpoint {
+                action: Some("list".to_string()),
+                target: None,
+            }))
+        );
+        assert_eq!(
+            parse_repl_slash_command("/list-runs 9"),
+            Ok(Some(SlashCommand::ListRuns {
+                limit: Some("9".to_string()),
+            }))
+        );
+        assert_eq!(
+            parse_repl_slash_command("/show-run run-9"),
+            Ok(Some(SlashCommand::ShowRun {
+                run_id: Some("run-9".to_string()),
+            }))
+        );
+        assert_eq!(parse_repl_slash_command("/definitely-unknown"), Ok(None));
+        assert_eq!(
+            parse_repl_slash_command("/home/vivek/projects/repo/app.py"),
+            Ok(None)
         );
     }
 
@@ -11322,7 +11677,7 @@ fn write_mcp_server_fixture(script_path: &Path) {
 
 #[cfg(test)]
 mod sandbox_report_tests {
-    use super::{format_sandbox_report, HookAbortMonitor};
+    use super::{HookAbortMonitor, format_sandbox_report};
     use runtime::HookAbortSignal;
     use std::sync::mpsc;
     use std::time::Duration;

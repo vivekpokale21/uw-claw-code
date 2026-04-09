@@ -6,10 +6,10 @@ use std::path::{Path, PathBuf};
 
 use plugins::{PluginError, PluginManager, PluginSummary};
 use runtime::{
-    compact_session, CompactionConfig, ConfigLoader, ConfigSource, McpOAuthConfig, McpServerConfig,
-    ScopedMcpServerConfig, Session,
+    CompactionConfig, ConfigLoader, ConfigSource, McpOAuthConfig, McpServerConfig,
+    ScopedMcpServerConfig, Session, compact_session,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandManifestEntry {
@@ -1030,9 +1030,30 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "budget",
         aliases: &[],
-        summary: "Show or set token budget limits",
-        argument_hint: Some("[show|set <limit>]"),
+        summary: "Show current context/token budget",
+        argument_hint: None,
         resume_supported: true,
+    },
+    SlashCommandSpec {
+        name: "checkpoint",
+        aliases: &[],
+        summary: "List or inspect autonomous run checkpoints",
+        argument_hint: Some("[list|<run-id>|list <limit>]"),
+        resume_supported: false,
+    },
+    SlashCommandSpec {
+        name: "list-runs",
+        aliases: &[],
+        summary: "List autonomous run checkpoints",
+        argument_hint: Some("[limit]"),
+        resume_supported: false,
+    },
+    SlashCommandSpec {
+        name: "show-run",
+        aliases: &[],
+        summary: "Show one autonomous checkpoint payload",
+        argument_hint: Some("<run-id>"),
+        resume_supported: false,
     },
     SlashCommandSpec {
         name: "rate-limit",
@@ -1054,6 +1075,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
 pub enum SlashCommand {
     Help,
     Status,
+    Budget,
     Sandbox,
     Compact,
     Bughunter {
@@ -1085,6 +1107,16 @@ pub enum SlashCommand {
     Cost,
     Resume {
         session_path: Option<String>,
+    },
+    Checkpoint {
+        action: Option<String>,
+        target: Option<String>,
+    },
+    ListRuns {
+        limit: Option<String>,
+    },
+    ShowRun {
+        run_id: Option<String>,
     },
     Config {
         section: Option<String>,
@@ -1252,6 +1284,10 @@ pub fn validate_slash_command_input(
             validate_no_args(command, &args)?;
             SlashCommand::Status
         }
+        "budget" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::Budget
+        }
         "sandbox" => {
             validate_no_args(command, &args)?;
             SlashCommand::Sandbox
@@ -1290,6 +1326,13 @@ pub fn validate_slash_command_input(
         }
         "resume" => SlashCommand::Resume {
             session_path: Some(require_remainder(command, remainder, "<session-path>")?),
+        },
+        "checkpoint" => parse_checkpoint_command(&args)?,
+        "list-runs" => SlashCommand::ListRuns {
+            limit: optional_single_arg(command, &args, "[limit]")?,
+        },
+        "show-run" => SlashCommand::ShowRun {
+            run_id: optional_single_arg(command, &args, "<run-id>")?,
         },
         "config" => SlashCommand::Config {
             section: parse_config_section(&args)?,
@@ -1528,7 +1571,10 @@ fn parse_session_command(args: &[&str]) -> Result<SlashCommand, SlashCommandPars
             action: Some("list".to_string()),
             target: None,
         }),
-        ["list", ..] => Err(usage_error("session", "[list|switch <session-id>|fork [branch-name]|delete <session-id> [--force]]")),
+        ["list", ..] => Err(usage_error(
+            "session",
+            "[list|switch <session-id>|fork [branch-name]|delete <session-id> [--force]]",
+        )),
         ["switch"] => Err(usage_error("session switch", "<session-id>")),
         ["switch", target] => Ok(SlashCommand::Session {
             action: Some("switch".to_string()),
@@ -1579,6 +1625,41 @@ fn parse_session_command(args: &[&str]) -> Result<SlashCommand, SlashCommandPars
             ),
             "session",
             "/session [list|switch <session-id>|fork [branch-name]|delete <session-id> [--force]]",
+        )),
+    }
+}
+
+fn parse_checkpoint_command(args: &[&str]) -> Result<SlashCommand, SlashCommandParseError> {
+    match args {
+        [] => Ok(SlashCommand::Checkpoint {
+            action: None,
+            target: None,
+        }),
+        ["list"] => Ok(SlashCommand::Checkpoint {
+            action: Some("list".to_string()),
+            target: None,
+        }),
+        ["list", target] => Ok(SlashCommand::Checkpoint {
+            action: Some("list".to_string()),
+            target: Some((*target).to_string()),
+        }),
+        ["list", ..] => Err(command_error(
+            "Unexpected arguments for /checkpoint list.",
+            "checkpoint",
+            "/checkpoint [list|<run-id>|list <limit>]",
+        )),
+        ["help" | "-h" | "--help"] => Ok(SlashCommand::Checkpoint {
+            action: Some("help".to_string()),
+            target: None,
+        }),
+        [run_id] => Ok(SlashCommand::Checkpoint {
+            action: Some((*run_id).to_string()),
+            target: None,
+        }),
+        _ => Err(command_error(
+            "Unexpected arguments for /checkpoint.",
+            "checkpoint",
+            "/checkpoint [list|<run-id>|list <limit>]",
         )),
     }
 }
@@ -1819,7 +1900,7 @@ fn slash_command_category(name: &str) -> &'static str {
         | "usage" | "stats" | "rename" | "clear" | "compact" | "history" | "tokens" | "cache"
         | "exit" | "summary" | "tag" | "thinkback" | "copy" | "share" | "feedback" | "rewind"
         | "pin" | "unpin" | "bookmarks" | "context" | "files" | "focus" | "unfocus" | "retry"
-        | "stop" | "undo" => "Session",
+        | "stop" | "undo" | "checkpoint" | "list-runs" | "show-run" => "Session",
         "diff" | "commit" | "pr" | "issue" | "branch" | "blame" | "log" | "git" | "stash"
         | "init" | "export" | "plan" | "review" | "security-review" | "bughunter" | "ultraplan"
         | "teleport" | "refactor" | "fix" | "autofix" | "explain" | "docs" | "perf" | "search"
@@ -2216,14 +2297,19 @@ pub fn handle_plugins_slash_command(
                 message: format!(
                     "Plugins\n  Result           updated {}\n  Name             {}\n  Old version      {}\n  New version      {}\n  Status           {}",
                     update.plugin_id,
-                    plugin
-                        .as_ref()
-                        .map_or_else(|| update.plugin_id.clone(), |plugin| plugin.metadata.name.clone()),
+                    plugin.as_ref().map_or_else(
+                        || update.plugin_id.clone(),
+                        |plugin| plugin.metadata.name.clone()
+                    ),
                     update.old_version,
                     update.new_version,
                     plugin
                         .as_ref()
-                        .map_or("unknown", |plugin| if plugin.enabled { "enabled" } else { "disabled" }),
+                        .map_or("unknown", |plugin| if plugin.enabled {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        }),
                 ),
                 reload_runtime: true,
             })
@@ -3943,6 +4029,7 @@ pub fn handle_slash_command(
             session: session.clone(),
         }),
         SlashCommand::Status
+        | SlashCommand::Budget
         | SlashCommand::Bughunter { .. }
         | SlashCommand::Commit
         | SlashCommand::Pr { .. }
@@ -3956,6 +4043,9 @@ pub fn handle_slash_command(
         | SlashCommand::Clear { .. }
         | SlashCommand::Cost
         | SlashCommand::Resume { .. }
+        | SlashCommand::Checkpoint { .. }
+        | SlashCommand::ListRuns { .. }
+        | SlashCommand::ShowRun { .. }
         | SlashCommand::Config { .. }
         | SlashCommand::Mcp { .. }
         | SlashCommand::Memory
@@ -4015,14 +4105,14 @@ pub fn handle_slash_command(
 #[cfg(test)]
 mod tests {
     use super::{
+        DefinitionSource, SkillOrigin, SkillRoot, SkillSlashDispatch, SlashCommand,
         classify_skills_slash_command, handle_agents_slash_command_json,
         handle_plugins_slash_command, handle_skills_slash_command_json, handle_slash_command,
         load_agents_from_roots, load_skills_from_roots, render_agents_report,
         render_agents_report_json, render_mcp_report_json_for, render_plugins_report,
         render_skills_report, render_slash_command_help, render_slash_command_help_detail,
         resolve_skill_path, resume_supported_slash_commands, slash_command_specs,
-        suggest_slash_commands, validate_slash_command_input, DefinitionSource, SkillOrigin,
-        SkillRoot, SkillSlashDispatch, SlashCommand,
+        suggest_slash_commands, validate_slash_command_input,
     };
     use plugins::{PluginKind, PluginManager, PluginManagerConfig, PluginMetadata, PluginSummary};
     use runtime::{
@@ -4120,6 +4210,10 @@ mod tests {
         assert_eq!(
             SlashCommand::parse(" /status "),
             Ok(Some(SlashCommand::Status))
+        );
+        assert_eq!(
+            SlashCommand::parse("/budget"),
+            Ok(Some(SlashCommand::Budget))
         );
         assert_eq!(
             SlashCommand::parse("/sandbox"),
@@ -4230,6 +4324,25 @@ mod tests {
             SlashCommand::parse("/resume session.json"),
             Ok(Some(SlashCommand::Resume {
                 session_path: Some("session.json".to_string()),
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/checkpoint list 12"),
+            Ok(Some(SlashCommand::Checkpoint {
+                action: Some("list".to_string()),
+                target: Some("12".to_string()),
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/list-runs 8"),
+            Ok(Some(SlashCommand::ListRuns {
+                limit: Some("8".to_string()),
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/show-run demo-run"),
+            Ok(Some(SlashCommand::ShowRun {
+                run_id: Some("demo-run".to_string()),
             }))
         );
         assert_eq!(
@@ -4468,8 +4581,10 @@ mod tests {
         assert!(show_error.contains("  Usage            /mcp show <server>"));
 
         let action_error = parse_error_message("/mcp inspect alpha");
-        assert!(action_error
-            .contains("Unknown /mcp action 'inspect'. Use list, show <server>, or help."));
+        assert!(
+            action_error
+                .contains("Unknown /mcp action 'inspect'. Use list, show <server>, or help.")
+        );
         assert!(action_error.contains("  Usage            /mcp [list|show <server>|help]"));
     }
 
@@ -4497,7 +4612,11 @@ mod tests {
         assert!(help.contains("/permissions [read-only|workspace-write|danger-full-access]"));
         assert!(help.contains("/clear [--confirm]"));
         assert!(help.contains("/cost"));
+        assert!(help.contains("/budget"));
         assert!(help.contains("/resume <session-path>"));
+        assert!(help.contains("/checkpoint [list|<run-id>|list <limit>]"));
+        assert!(help.contains("/list-runs [limit]"));
+        assert!(help.contains("/show-run <run-id>"));
         assert!(help.contains("/config [env|hooks|model|plugins]"));
         assert!(help.contains("/mcp [list|show <server>|help]"));
         assert!(help.contains("/memory"));
@@ -4514,7 +4633,7 @@ mod tests {
         assert!(help.contains("/agents [list|help]"));
         assert!(help.contains("/skills [list|install <path>|help|<skill> [args]]"));
         assert!(help.contains("aliases: /skill"));
-        assert_eq!(slash_command_specs().len(), 141);
+        assert_eq!(slash_command_specs().len(), 144);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 
@@ -4543,7 +4662,9 @@ mod tests {
 
         assert!(help.contains("Keyboard shortcuts"));
         assert!(help.contains("Up/Down              Navigate prompt history"));
-        assert!(help.contains("Tab                  Complete commands, modes, and recent sessions"));
+        assert!(
+            help.contains("Tab                  Complete commands, modes, and recent sessions")
+        );
         assert!(help.contains("Ctrl-C               Clear input (or exit on empty prompt)"));
         assert!(help.contains("Shift+Enter/Ctrl+J   Insert a newline"));
 
@@ -4683,30 +4804,36 @@ mod tests {
         assert!(
             handle_slash_command("/model claude", &session, CompactionConfig::default()).is_none()
         );
-        assert!(handle_slash_command(
-            "/permissions read-only",
-            &session,
-            CompactionConfig::default()
-        )
-        .is_none());
+        assert!(
+            handle_slash_command(
+                "/permissions read-only",
+                &session,
+                CompactionConfig::default()
+            )
+            .is_none()
+        );
         assert!(handle_slash_command("/clear", &session, CompactionConfig::default()).is_none());
         assert!(
             handle_slash_command("/clear --confirm", &session, CompactionConfig::default())
                 .is_none()
         );
         assert!(handle_slash_command("/cost", &session, CompactionConfig::default()).is_none());
-        assert!(handle_slash_command(
-            "/resume session.json",
-            &session,
-            CompactionConfig::default()
-        )
-        .is_none());
-        assert!(handle_slash_command(
-            "/resume session.jsonl",
-            &session,
-            CompactionConfig::default()
-        )
-        .is_none());
+        assert!(
+            handle_slash_command(
+                "/resume session.json",
+                &session,
+                CompactionConfig::default()
+            )
+            .is_none()
+        );
+        assert!(
+            handle_slash_command(
+                "/resume session.jsonl",
+                &session,
+                CompactionConfig::default()
+            )
+            .is_none()
+        );
         assert!(handle_slash_command("/config", &session, CompactionConfig::default()).is_none());
         assert!(
             handle_slash_command("/config env", &session, CompactionConfig::default()).is_none()
@@ -5008,8 +5135,11 @@ mod tests {
             super::handle_agents_slash_command(Some("help"), &cwd).expect("agents help");
         assert!(agents_help.contains("Usage            /agents [list|help]"));
         assert!(agents_help.contains("Direct CLI       claw agents"));
-        assert!(agents_help
-            .contains("Sources          .claw/agents, ~/.claw/agents, $CLAW_CONFIG_HOME/agents"));
+        assert!(
+            agents_help.contains(
+                "Sources          .claw/agents, ~/.claw/agents, $CLAW_CONFIG_HOME/agents"
+            )
+        );
 
         let agents_unexpected =
             super::handle_agents_slash_command(Some("show planner"), &cwd).expect("agents usage");
@@ -5017,11 +5147,15 @@ mod tests {
 
         let skills_help =
             super::handle_skills_slash_command(Some("--help"), &cwd).expect("skills help");
-        assert!(skills_help
-            .contains("Usage            /skills [list|install <path>|help|<skill> [args]]"));
+        assert!(
+            skills_help
+                .contains("Usage            /skills [list|install <path>|help|<skill> [args]]")
+        );
         assert!(skills_help.contains("Alias            /skill"));
         assert!(skills_help.contains("Invoke           /skills help overview -> $help overview"));
-        assert!(skills_help.contains("Install root     $CLAW_CONFIG_HOME/skills or ~/.claw/skills"));
+        assert!(
+            skills_help.contains("Install root     $CLAW_CONFIG_HOME/skills or ~/.claw/skills")
+        );
         assert!(skills_help.contains(".omc/skills"));
         assert!(skills_help.contains(".agents/skills"));
         assert!(skills_help.contains("~/.claude/skills/omc-learned"));
@@ -5033,15 +5167,19 @@ mod tests {
 
         let skills_install_help = super::handle_skills_slash_command(Some("install --help"), &cwd)
             .expect("nested skills help");
-        assert!(skills_install_help
-            .contains("Usage            /skills [list|install <path>|help|<skill> [args]]"));
+        assert!(
+            skills_install_help
+                .contains("Usage            /skills [list|install <path>|help|<skill> [args]]")
+        );
         assert!(skills_install_help.contains("Alias            /skill"));
         assert!(skills_install_help.contains("Unexpected       install"));
 
         let skills_unknown_help =
             super::handle_skills_slash_command(Some("show --help"), &cwd).expect("skills help");
-        assert!(skills_unknown_help
-            .contains("Usage            /skills [list|install <path>|help|<skill> [args]]"));
+        assert!(
+            skills_unknown_help
+                .contains("Usage            /skills [list|install <path>|help|<skill> [args]]")
+        );
         assert!(skills_unknown_help.contains("Unexpected       show"));
 
         let skills_help_json =
@@ -5053,9 +5191,11 @@ mod tests {
         assert!(sources.iter().any(|value| value == ".omc/skills"));
         assert!(sources.iter().any(|value| value == ".agents/skills"));
         assert!(sources.iter().any(|value| value == "~/.omc/skills"));
-        assert!(sources
-            .iter()
-            .any(|value| value == "~/.claude/skills/omc-learned"));
+        assert!(
+            sources
+                .iter()
+                .any(|value| value == "~/.claude/skills/omc-learned")
+        );
 
         let _ = fs::remove_dir_all(cwd);
     }
@@ -5102,7 +5242,9 @@ mod tests {
         assert!(report.contains("trace · Compatibility skill guidance"));
         assert!(report.contains("cancel · OMC cancel guidance"));
         assert!(report.contains("statusline · Claude config skill guidance"));
-        assert!(report.contains("doctor-check · Claude config command guidance · legacy /commands"));
+        assert!(
+            report.contains("doctor-check · Claude config command guidance · legacy /commands")
+        );
         assert!(report.contains("learned · Learned skill guidance"));
 
         let help =
@@ -5114,9 +5256,11 @@ mod tests {
         assert!(sources.iter().any(|value| value == ".omc/skills"));
         assert!(sources.iter().any(|value| value == ".agents/skills"));
         assert!(sources.iter().any(|value| value == "~/.omc/skills"));
-        assert!(sources
-            .iter()
-            .any(|value| value == "~/.claude/skills/omc-learned"));
+        assert!(
+            sources
+                .iter()
+                .any(|value| value == "~/.claude/skills/omc-learned")
+        );
 
         restore_env_var("HOME", original_home);
         restore_env_var("CLAUDE_CONFIG_DIR", original_claude_config_dir);
@@ -5342,11 +5486,13 @@ mod tests {
         assert_eq!(installed.display_name.as_deref(), Some("help"));
         assert!(installed.installed_path.ends_with(Path::new("help")));
         assert!(installed.installed_path.join("SKILL.md").is_file());
-        assert!(installed
-            .installed_path
-            .join("scripts")
-            .join("run.sh")
-            .is_file());
+        assert!(
+            installed
+                .installed_path
+                .join("scripts")
+                .join("run.sh")
+                .is_file()
+        );
 
         let report = super::render_skill_install_report(&installed);
         assert!(report.contains("Result           installed help"));

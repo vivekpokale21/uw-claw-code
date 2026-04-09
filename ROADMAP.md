@@ -9,6 +9,10 @@
   - OpenAI-compatible runtime defaults switched to localhost-first (`http://127.0.0.1:8080/v1`).
   - `LLM_BASE_URL` now overrides `OPENAI_BASE_URL` for OpenAI-compatible local runtime ergonomics.
   - OpenAI-compatible localhost endpoint now supports no-key local runs.
+- 2026-04-09 — Slice 2 complete:
+  - Rust slash-command parser and runtime dispatch now support `/budget`, `/checkpoint`, `/list-runs`, `/show-run`.
+  - REPL now passthroughs unknown slash inputs as prompt text (absolute path prompts no longer fail command parsing).
+  - Run inspection reads autonomous checkpoint artifacts from `<git-root>/.port_sessions`.
 
 ## Goal
 

@@ -12,9 +12,20 @@ Last updated: 2026-04-09
 - OpenAI-compatible local endpoints now allow missing API key when base URL is localhost.
 - Provider detection now prefers OpenAI-compatible routing for local-model families (`qwen*`, `llama*`, `mistral*`, `deepseek*`, `phi*`) and `model:tag` style IDs (for example `qwen3.5:4b`), while keeping explicit prefix routing behavior.
 
+### Slice 2 — Rust AFK controls/parity commands + run inspection (2026-04-09)
+
+- Rust slash-command parser now supports `/budget`, `/checkpoint`, `/list-runs`, and `/show-run`.
+- Rust REPL dispatch now implements:
+  - `/budget` context/token budget report
+  - `/checkpoint [list|<run-id>|list <limit>]`
+  - `/list-runs [limit]`
+  - `/show-run <run-id>`
+- Run-inspection reads checkpoint artifacts from `<git-root>/.port_sessions/autonomous_<run-id>.json`.
+- Unknown slash commands in the REPL now passthrough to prompt text (for example absolute path prompts like `/home/...`) instead of being hard-rejected as command errors.
+
 ## Current Status
 
-Slice 1 of Claude Code workflow reconstruction for AFK reliability is now implemented on top of
+Slice 2 of Claude Code workflow reconstruction for AFK reliability is now implemented on top of
 `llama.cpp + qwen3.5:4b`.
 
 Background framing for continuity:

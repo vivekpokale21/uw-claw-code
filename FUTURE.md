@@ -7,10 +7,11 @@ Last updated: 2026-04-09
 ### Completed
 
 - Slice 1 (2026-04-09): Rust local runtime defaults and OpenAI-compatible base URL behavior now align with local llama.cpp-first operation (`qwen3.5:4b`, localhost `/v1`, `LLM_BASE_URL` precedence, local no-key allowance).
+- Slice 2 (2026-04-09): Rust AFK slash parity now includes `/budget`, `/checkpoint`, `/list-runs`, `/show-run`, and REPL unknown-slash passthrough for absolute-path prompts.
 
 ### Next
 
-- Slice 2: Rust AFK command/control parity (`/checkpoint`, `/list-runs`, `/show-run`, `/budget`) plus unknown-slash passthrough in REPL.
+- Slice 3: Rust loop reliability hardening (phase/tool-loop bounds, deterministic stall/no-progress stop reasons, structured compaction/memory carryover).
 
 ## Priority Backlog
 
