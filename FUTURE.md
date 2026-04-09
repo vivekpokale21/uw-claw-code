@@ -9,10 +9,11 @@ Last updated: 2026-04-09
 - Slice 1 (2026-04-09): Rust local runtime defaults and OpenAI-compatible base URL behavior now align with local llama.cpp-first operation (`qwen3.5:4b`, localhost `/v1`, `LLM_BASE_URL` precedence, local no-key allowance).
 - Slice 2 (2026-04-09): Rust AFK slash parity now includes `/budget`, `/checkpoint`, `/list-runs`, `/show-run`, and REPL unknown-slash passthrough for absolute-path prompts.
 - Slice 3 (2026-04-09): Rust turn-loop reliability now includes deterministic `tool_loop_stalled` / `no_progress_stalled` stop reasons, bounded repetition guards, and pre-turn budget/auto-compaction safeguards.
+- Slice 4 (2026-04-09): Rust LSP path now persists and reloads health telemetry in `.port_sessions/lsp_health_state.json`, enforces cooldown-backed retry suppression, and exposes `health`/`status` inspection via the Rust LSP tool surface.
 
 ### Next
 
-- Slice 4: Rust LSP retrieval/health persistence on primary path (Python bridge only where Rust is blocked).
+- Slice 5: Rust CLI UX polish (statusline, streaming, slash parity) on primary path.
 
 ## Priority Backlog
 

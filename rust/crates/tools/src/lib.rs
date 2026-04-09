@@ -1059,7 +1059,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["symbols", "references", "diagnostics", "definition", "hover"] },
+                    "action": { "type": "string", "enum": ["symbols", "references", "diagnostics", "definition", "hover", "health", "status"] },
                     "path": { "type": "string" },
                     "line": { "type": "integer", "minimum": 0 },
                     "character": { "type": "integer", "minimum": 0 },
@@ -1610,15 +1610,36 @@ fn run_lsp(input: LspInput) -> Result<String, String> {
     let line = input.line;
     let character = input.character;
     let query = input.query.as_deref();
+    let repo_root = std::env::current_dir().ok();
 
-    match registry.dispatch(action, path, line, character, query) {
-        Ok(result) => to_pretty_json(result),
-        Err(e) => to_pretty_json(json!({
+    let load_warning = registry
+        .load_health_from_default_path(repo_root.as_deref())
+        .err();
+
+    let mut payload = match registry.dispatch(action, path, line, character, query) {
+        Ok(result) => result,
+        Err(e) => json!({
             "action": action,
             "error": e,
             "status": "error"
-        })),
+        }),
+    };
+
+    let persisted_path = registry
+        .persist_health_to_default_path(repo_root.as_deref())
+        .ok()
+        .map(|path_buf| path_buf.display().to_string());
+
+    if let Some(map) = payload.as_object_mut() {
+        if let Some(path) = persisted_path {
+            map.insert("lsp_health_state_path".to_string(), json!(path));
+        }
+        if let Some(warning) = load_warning {
+            map.insert("lsp_health_load_warning".to_string(), json!(warning));
+        }
     }
+
+    to_pretty_json(payload)
 }
 
 #[allow(clippy::needless_pass_by_value)]

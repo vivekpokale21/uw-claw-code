@@ -9,6 +9,7 @@ Last updated: 2026-04-09
   - Slice 1 complete (2026-04-09): Rust default model is now `qwen3.5:4b`, OpenAI-compatible default endpoint is now localhost-first (`http://127.0.0.1:8080/v1`), `LLM_BASE_URL` takes precedence over `OPENAI_BASE_URL`, and OpenAI-compatible localhost runs allow missing API key.
   - Slice 2 complete (2026-04-09): Rust slash parity now includes `/budget`, `/checkpoint`, `/list-runs`, `/show-run`; REPL unknown slash inputs now passthrough as prompt text so absolute path prompts are not blocked.
   - Slice 3 complete (2026-04-09): Rust runtime loop now reports deterministic `tool_loop_stalled` / `no_progress_stalled` stop reasons with bounded repeat guards, plus pre-turn budget status and pre-turn auto-compaction in REPL flow.
+  - Slice 4 complete (2026-04-09): Rust LSP dispatch now persists/reloads health telemetry (`.port_sessions/lsp_health_state.json`), enforces cooldown-backed failure suppression, and exposes `health`/`status` actions through the Rust tool surface.
 - Requested 9-lane checkpoint: **All 9 lanes merged on `main`.**
 - Current `main` HEAD: `ee31e00` (stub implementations replaced with real AskUserQuestion + RemoteTrigger).
 - Repository stats at this checkpoint: **292 commits on `main` / 293 across all branches**, **9 crates**, **48,599 tracked Rust LOC**, **2,568 test LOC**, **3 authors**, date range **2026-03-31 → 2026-04-03**.
@@ -129,8 +130,8 @@ Canonical scenario map: `rust/mock_parity_scenarios.json`
 - **Feature commit:** `2d66503` — `feat(runtime+tools): LspRegistry — LSP client dispatch for tool surface`
 - **Merge commit:** `d7f0dc6` — `Merge jobdori/lsp-client: LspRegistry dispatch for all LSP tool actions`
 - **Evidence:** `rust/crates/runtime/src/lsp_client.rs` is **438 LOC** and models diagnostics, hover, definition, references, completion, symbols, and formatting across a stateful registry.
-- **Wiring:** the exposed `LSP` tool schema in `rust/crates/tools/src/lib.rs` currently enumerates `symbols`, `references`, `diagnostics`, `definition`, and `hover`, then routes requests through `registry.dispatch(action, path, line, character, query)`.
-- **Scope:** current parity is registry/dispatch-level; completion/format support exists in the registry model, but not as clearly exposed at the tool schema boundary, and actual external language-server process orchestration remains separate.
+- **Wiring:** the exposed `LSP` tool schema in `rust/crates/tools/src/lib.rs` now enumerates `symbols`, `references`, `diagnostics`, `definition`, `hover`, `health`, and `status`, then routes requests through `registry.dispatch(action, path, line, character, query)`.
+- **Scope:** parity now includes persisted health snapshots and cooldown enforcement on the Rust path, while actual external language-server process orchestration remains separate.
 
 ### Lane 9 — Permission enforcement
 

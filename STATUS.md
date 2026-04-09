@@ -34,9 +34,30 @@ Last updated: 2026-04-09
 - Rust REPL loop now prints pre-turn context budget status and runs pre-turn auto-compaction when context exceeds threshold.
 - Added pre-turn auto-compaction reliability path using model-aware context thresholds (`AUTO_COMPACT_TRIGGER_PERCENT=85`) before model calls.
 
+### Slice 4 — Rust LSP retrieval health persistence (2026-04-09)
+
+- Rust LSP runtime now tracks per-language health telemetry with deterministic cooldown/backoff fields:
+  - `consecutive_failures`
+  - `blocked_until_unix`
+  - `last_error`
+  - `last_attempt_unix`
+  - `last_success_unix`
+  - `total_attempts`
+  - `total_failures`
+  - `last_warning`
+  - `last_capabilities`
+  - `last_failure_kind`
+  - `recent_crash_loops`
+- Rust LSP dispatch now enforces cooldown stop behavior before repeated failing requests and reports explicit cooldown errors.
+- Rust LSP dispatch now supports `health`/`status` actions for structured health + server snapshots.
+- Rust tools `LSP` execution now auto-loads and persists health state at:
+  - default: `<repo-root>/.port_sessions/lsp_health_state.json`
+  - override: `CLAW_LSP_HEALTH_STATE_FILE` or `LSP_HEALTH_STATE_FILE`
+- Rust tools `LSP` schema now includes `health` and `status` actions.
+
 ## Current Status
 
-Slice 3 of Claude Code workflow reconstruction for AFK reliability is now implemented on top of
+Slice 4 of Claude Code workflow reconstruction for AFK reliability is now implemented on top of
 `llama.cpp + qwen3.5:4b`.
 
 Background framing for continuity:

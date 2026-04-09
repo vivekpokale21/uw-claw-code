@@ -17,6 +17,10 @@
   - Rust conversation runtime now emits deterministic stall stop reasons (`tool_loop_stalled`, `no_progress_stalled`) with explicit bounded guards.
   - Rust REPL loop now surfaces pre-turn context budget status and runs pre-turn auto-compaction when context pressure is high.
   - Loop reliability guardrails are now env-configurable via `CLAW_TOOL_LOOP_STALL_LIMIT` and `CLAW_NO_PROGRESS_STALL_LIMIT`.
+- 2026-04-09 — Slice 4 complete:
+  - Rust LSP runtime now persists and reloads health telemetry in `.port_sessions/lsp_health_state.json` (with `CLAW_LSP_HEALTH_STATE_FILE`/`LSP_HEALTH_STATE_FILE` overrides).
+  - Rust LSP dispatch now enforces cooldown-backed stop behavior after repeated failures on a per-language key.
+  - Rust LSP tool surface now exposes `health`/`status` actions for runtime inspection.
 
 ## Goal
 

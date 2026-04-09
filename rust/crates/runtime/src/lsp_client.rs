@@ -2,7 +2,10 @@
 //! LSP (Language Server Protocol) client registry for tool dispatch.
 
 use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -11,6 +14,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum LspAction {
     Diagnostics,
+    Health,
     Hover,
     Definition,
     References,
@@ -23,6 +27,7 @@ impl LspAction {
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "diagnostics" => Some(Self::Diagnostics),
+            "health" | "status" => Some(Self::Health),
             "hover" => Some(Self::Hover),
             "definition" | "goto_definition" => Some(Self::Definition),
             "references" | "find_references" => Some(Self::References),
@@ -106,6 +111,46 @@ pub struct LspServerState {
     pub diagnostics: Vec<LspDiagnostic>,
 }
 
+const DEFAULT_LSP_HEALTH_STATE_FILE: &str = "lsp_health_state.json";
+const DEFAULT_LSP_STATE_DIR: &str = ".port_sessions";
+const DEFAULT_LSP_HEALTH_VERSION: u32 = 1;
+const DEFAULT_LSP_MAX_CONSECUTIVE_FAILURES: u32 = 3;
+const DEFAULT_LSP_COOLDOWN_SECONDS: f64 = 300.0;
+const ENV_LSP_HEALTH_STATE_FILE: &str = "LSP_HEALTH_STATE_FILE";
+const ENV_CLAW_LSP_HEALTH_STATE_FILE: &str = "CLAW_LSP_HEALTH_STATE_FILE";
+const ENV_LSP_MAX_CONSECUTIVE_FAILURES: &str = "LSP_MAX_CONSECUTIVE_FAILURES";
+const ENV_LSP_COOLDOWN_SECONDS: &str = "LSP_COOLDOWN_SECONDS";
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct LspHealthState {
+    pub consecutive_failures: u32,
+    pub blocked_until_unix: f64,
+    pub last_error: String,
+    pub last_attempt_unix: f64,
+    pub last_success_unix: f64,
+    pub total_attempts: u64,
+    pub total_failures: u64,
+    pub last_warning: String,
+    pub last_capabilities: String,
+    pub last_failure_kind: String,
+    pub recent_crash_loops: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedLspHealthPayload {
+    #[serde(default = "default_lsp_health_version")]
+    version: u32,
+    #[serde(default)]
+    saved_unix: f64,
+    #[serde(default)]
+    health: HashMap<String, LspHealthState>,
+}
+
+const fn default_lsp_health_version() -> u32 {
+    DEFAULT_LSP_HEALTH_VERSION
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct LspRegistry {
     inner: Arc<Mutex<RegistryInner>>,
@@ -114,6 +159,7 @@ pub struct LspRegistry {
 #[derive(Debug, Default)]
 struct RegistryInner {
     servers: HashMap<String, LspServerState>,
+    health: HashMap<String, LspHealthState>,
 }
 
 impl LspRegistry {
@@ -149,26 +195,7 @@ impl LspRegistry {
 
     /// Find the appropriate server for a file path based on extension.
     pub fn find_server_for_path(&self, path: &str) -> Option<LspServerState> {
-        let ext = std::path::Path::new(path)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
-
-        let language = match ext {
-            "rs" => "rust",
-            "ts" | "tsx" => "typescript",
-            "js" | "jsx" => "javascript",
-            "py" => "python",
-            "go" => "go",
-            "java" => "java",
-            "c" | "h" => "c",
-            "cpp" | "hpp" | "cc" => "cpp",
-            "rb" => "ruby",
-            "lua" => "lua",
-            _ => return None,
-        };
-
-        self.get(language)
+        language_for_path(path).and_then(|language| self.get(language))
     }
 
     /// List all registered servers.
@@ -232,6 +259,88 @@ impl LspRegistry {
         self.len() == 0
     }
 
+    /// Snapshot current LSP health state.
+    pub fn health_snapshot(&self) -> HashMap<String, LspHealthState> {
+        let inner = self.inner.lock().expect("lsp registry lock poisoned");
+        inner.health.clone()
+    }
+
+    /// Load persisted health state from a JSON file.
+    pub fn load_health_from_path(&self, path: &Path) -> Result<usize, String> {
+        if !path.exists() {
+            return Ok(0);
+        }
+        let raw = fs::read_to_string(path)
+            .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+        let payload: PersistedLspHealthPayload = serde_json::from_str(&raw)
+            .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
+        let loaded = payload.health.len();
+        let mut inner = self.inner.lock().expect("lsp registry lock poisoned");
+        for (key, state) in payload.health {
+            inner.health.insert(key, state);
+        }
+        Ok(loaded)
+    }
+
+    /// Persist health state to a JSON file.
+    pub fn persist_health_to_path(&self, path: &Path) -> Result<(), String> {
+        let health = {
+            let inner = self.inner.lock().expect("lsp registry lock poisoned");
+            inner.health.clone()
+        };
+        let payload = PersistedLspHealthPayload {
+            version: DEFAULT_LSP_HEALTH_VERSION,
+            saved_unix: now_unix_seconds(),
+            health,
+        };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+        }
+        let serialized = serde_json::to_string_pretty(&payload)
+            .map_err(|error| format!("failed to serialize health payload: {error}"))?;
+        fs::write(path, serialized)
+            .map_err(|error| format!("failed to write {}: {error}", path.display()))
+    }
+
+    #[must_use]
+    pub fn default_health_state_path(repo_root: Option<&Path>) -> PathBuf {
+        if let Some(raw) = std::env::var_os(ENV_CLAW_LSP_HEALTH_STATE_FILE)
+            .or_else(|| std::env::var_os(ENV_LSP_HEALTH_STATE_FILE))
+        {
+            let candidate = PathBuf::from(raw);
+            if candidate.is_absolute() {
+                return candidate;
+            }
+            let root = repo_root
+                .map(Path::to_path_buf)
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_else(|| PathBuf::from("."));
+            return root.join(candidate);
+        }
+
+        let root = repo_root
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+        root.join(DEFAULT_LSP_STATE_DIR)
+            .join(DEFAULT_LSP_HEALTH_STATE_FILE)
+    }
+
+    pub fn load_health_from_default_path(&self, repo_root: Option<&Path>) -> Result<usize, String> {
+        let path = Self::default_health_state_path(repo_root);
+        self.load_health_from_path(&path)
+    }
+
+    pub fn persist_health_to_default_path(
+        &self,
+        repo_root: Option<&Path>,
+    ) -> Result<PathBuf, String> {
+        let path = Self::default_health_state_path(repo_root);
+        self.persist_health_to_path(&path)?;
+        Ok(path)
+    }
+
     /// Dispatch an LSP action and return a structured result.
     pub fn dispatch(
         &self,
@@ -243,6 +352,10 @@ impl LspRegistry {
     ) -> Result<serde_json::Value, String> {
         let lsp_action =
             LspAction::from_str(action).ok_or_else(|| format!("unknown LSP action: {action}"))?;
+
+        if lsp_action == LspAction::Health {
+            return Ok(self.health_status_payload());
+        }
 
         // For diagnostics, we can check existing cached diagnostics
         if lsp_action == LspAction::Diagnostics {
@@ -271,15 +384,53 @@ impl LspRegistry {
 
         // For other actions, we need a connected server for the given file
         let path = path.ok_or("path is required for this LSP action")?;
-        let server = self
-            .find_server_for_path(path)
-            .ok_or_else(|| format!("no LSP server available for path: {path}"))?;
+        let health_key = language_for_path(path).map(str::to_owned);
+
+        if let Some(key) = health_key.as_deref() {
+            if let Some(cooldown_remaining) = self.cooldown_remaining_seconds(key) {
+                let message = self
+                    .last_health_error(key)
+                    .map_or_else(String::new, |error| format!(" after error: {error}"));
+                return Err(format!(
+                    "LSP action blocked for '{key}': cooldown active for {cooldown_remaining:.1}s{message}"
+                ));
+            }
+            self.record_attempt(key);
+        }
+
+        let server = match self.find_server_for_path(path) {
+            Some(server) => server,
+            None => {
+                if let Some(key) = health_key.as_deref() {
+                    self.record_failure(
+                        key,
+                        "request",
+                        format!("no LSP server available for path: {path}"),
+                    );
+                }
+                return Err(format!("no LSP server available for path: {path}"));
+            }
+        };
 
         if server.status != LspServerStatus::Connected {
+            if let Some(key) = health_key.as_deref() {
+                self.record_failure(
+                    key,
+                    "startup",
+                    format!(
+                        "LSP server for '{}' is not connected (status: {})",
+                        server.language, server.status
+                    ),
+                );
+            }
             return Err(format!(
                 "LSP server for '{}' is not connected (status: {})",
                 server.language, server.status
             ));
+        }
+
+        if let Some(key) = health_key.as_deref() {
+            self.record_success(key, &server.capabilities);
         }
 
         // Return structured placeholder — actual LSP JSON-RPC calls would
@@ -294,6 +445,149 @@ impl LspRegistry {
             "message": format!("LSP {} dispatched to {} server", action, server.language)
         }))
     }
+
+    fn record_attempt(&self, health_key: &str) {
+        let mut inner = self.inner.lock().expect("lsp registry lock poisoned");
+        let state = inner.health.entry(health_key.to_string()).or_default();
+        state.total_attempts = state.total_attempts.saturating_add(1);
+        state.last_attempt_unix = now_unix_seconds();
+    }
+
+    fn record_success(&self, health_key: &str, capabilities: &[String]) {
+        let mut inner = self.inner.lock().expect("lsp registry lock poisoned");
+        let state = inner.health.entry(health_key.to_string()).or_default();
+        state.consecutive_failures = 0;
+        state.blocked_until_unix = 0.0;
+        state.last_success_unix = now_unix_seconds();
+        state.last_failure_kind.clear();
+        state.recent_crash_loops = 0;
+        state.last_warning.clear();
+        state.last_error.clear();
+        state.last_capabilities = summarize_capabilities(capabilities);
+    }
+
+    fn record_failure(&self, health_key: &str, failure_kind: &str, error: String) {
+        let now = now_unix_seconds();
+        let max_failures = lsp_max_consecutive_failures();
+        let cooldown = lsp_cooldown_seconds();
+        let mut inner = self.inner.lock().expect("lsp registry lock poisoned");
+        let state = inner.health.entry(health_key.to_string()).or_default();
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        state.total_failures = state.total_failures.saturating_add(1);
+        state.last_error = error;
+        state.last_failure_kind = failure_kind.to_string();
+        if state.consecutive_failures >= max_failures {
+            state.blocked_until_unix = now + cooldown;
+        }
+    }
+
+    fn cooldown_remaining_seconds(&self, health_key: &str) -> Option<f64> {
+        let now = now_unix_seconds();
+        let inner = self.inner.lock().expect("lsp registry lock poisoned");
+        let state = inner.health.get(health_key)?;
+        if state.blocked_until_unix <= now {
+            return None;
+        }
+        Some(state.blocked_until_unix - now)
+    }
+
+    fn last_health_error(&self, health_key: &str) -> Option<String> {
+        let inner = self.inner.lock().expect("lsp registry lock poisoned");
+        inner
+            .health
+            .get(health_key)
+            .map(|state| state.last_error.clone())
+            .filter(|value| !value.is_empty())
+    }
+
+    fn health_status_payload(&self) -> serde_json::Value {
+        let now = now_unix_seconds();
+        let inner = self.inner.lock().expect("lsp registry lock poisoned");
+        let mut health = serde_json::Map::new();
+        let mut keys = inner.health.keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        for key in keys {
+            if let Some(state) = inner.health.get(&key) {
+                let cooldown_remaining = (state.blocked_until_unix - now).max(0.0);
+                health.insert(
+                    key,
+                    serde_json::json!({
+                        "consecutive_failures": state.consecutive_failures,
+                        "cooldown_remaining_seconds": cooldown_remaining,
+                        "last_error": state.last_error,
+                        "last_attempt_unix": state.last_attempt_unix,
+                        "last_success_unix": state.last_success_unix,
+                        "total_attempts": state.total_attempts,
+                        "total_failures": state.total_failures,
+                        "last_warning": state.last_warning,
+                        "last_capabilities": state.last_capabilities,
+                        "last_failure_kind": state.last_failure_kind,
+                        "recent_crash_loops": state.recent_crash_loops
+                    }),
+                );
+            }
+        }
+        let mut servers = inner.servers.values().cloned().collect::<Vec<_>>();
+        servers.sort_by(|left, right| left.language.cmp(&right.language));
+        serde_json::json!({
+            "action": "health",
+            "servers": servers,
+            "health": health,
+            "count": health.len()
+        })
+    }
+}
+
+fn language_for_path(path: &str) -> Option<&'static str> {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|value| value.to_str())?;
+    match ext {
+        "rs" => Some("rust"),
+        "ts" | "tsx" => Some("typescript"),
+        "js" | "jsx" => Some("javascript"),
+        "py" => Some("python"),
+        "go" => Some("go"),
+        "java" => Some("java"),
+        "c" | "h" => Some("c"),
+        "cpp" | "hpp" | "cc" => Some("cpp"),
+        "rb" => Some("ruby"),
+        "lua" => Some("lua"),
+        _ => None,
+    }
+}
+
+fn summarize_capabilities(capabilities: &[String]) -> String {
+    if capabilities.is_empty() {
+        return "none".to_string();
+    }
+    let mut sorted = capabilities.to_vec();
+    sorted.sort();
+    sorted.dedup();
+    sorted.join(",")
+}
+
+fn lsp_max_consecutive_failures() -> u32 {
+    std::env::var(ENV_LSP_MAX_CONSECUTIVE_FAILURES)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .map(|value| value.max(1))
+        .unwrap_or(DEFAULT_LSP_MAX_CONSECUTIVE_FAILURES)
+}
+
+fn lsp_cooldown_seconds() -> f64 {
+    std::env::var(ENV_LSP_COOLDOWN_SECONDS)
+        .ok()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .map(|value| value.max(1.0))
+        .unwrap_or(DEFAULT_LSP_COOLDOWN_SECONDS)
+}
+
+fn now_unix_seconds() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs_f64())
+        .unwrap_or(0.0)
 }
 
 #[cfg(test)]
@@ -399,17 +693,21 @@ mod tests {
         let registry = LspRegistry::new();
         registry.register("rust", LspServerStatus::Disconnected, None, vec![]);
 
-        assert!(registry
-            .dispatch("hover", Some("src/main.rs"), Some(1), Some(0), None)
-            .is_err());
+        assert!(
+            registry
+                .dispatch("hover", Some("src/main.rs"), Some(1), Some(0), None)
+                .is_err()
+        );
     }
 
     #[test]
     fn rejects_unknown_action() {
         let registry = LspRegistry::new();
-        assert!(registry
-            .dispatch("unknown_action", Some("file.rs"), None, None, None)
-            .is_err());
+        assert!(
+            registry
+                .dispatch("unknown_action", Some("file.rs"), None, None, None)
+                .is_err()
+        );
     }
 
     #[test]
@@ -428,6 +726,8 @@ mod tests {
         // given
         let cases = [
             ("diagnostics", Some(LspAction::Diagnostics)),
+            ("health", Some(LspAction::Health)),
+            ("status", Some(LspAction::Health)),
             ("hover", Some(LspAction::Hover)),
             ("definition", Some(LspAction::Definition)),
             ("goto_definition", Some(LspAction::Definition)),
@@ -724,12 +1024,16 @@ mod tests {
 
         // then
         assert_eq!(diagnostics.len(), 2);
-        assert!(diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.message == "warn"));
-        assert!(diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.message == "err"));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message == "warn")
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message == "err")
+        );
     }
 
     #[test]
@@ -743,5 +1047,86 @@ mod tests {
         // then
         let error = result.expect_err("missing language should fail");
         assert!(error.contains("LSP server not found for language: missing"));
+    }
+
+    #[test]
+    fn health_state_round_trip_blocks_after_reload() {
+        // given
+        let path = temp_health_path("round-trip");
+        let registry = LspRegistry::new();
+        registry.register("rust", LspServerStatus::Disconnected, None, vec![]);
+
+        // when
+        for _ in 0..3 {
+            let _ = registry.dispatch("hover", Some("src/main.rs"), Some(1), Some(0), None);
+        }
+        let blocked = registry
+            .dispatch("hover", Some("src/main.rs"), Some(1), Some(0), None)
+            .expect_err("dispatch should be blocked after repeated failures");
+        assert!(
+            blocked.contains("cooldown"),
+            "expected cooldown error, got: {blocked}"
+        );
+        registry
+            .persist_health_to_path(&path)
+            .expect("health state should persist");
+
+        let reloaded = LspRegistry::new();
+        reloaded
+            .load_health_from_path(&path)
+            .expect("health state should reload");
+        reloaded.register("rust", LspServerStatus::Disconnected, None, vec![]);
+
+        // then
+        let after_reload = reloaded
+            .dispatch("hover", Some("src/main.rs"), Some(1), Some(0), None)
+            .expect_err("reloaded health should preserve cooldown");
+        assert!(
+            after_reload.contains("cooldown"),
+            "expected cooldown after reload, got: {after_reload}"
+        );
+
+        cleanup_temp_health_path(&path);
+    }
+
+    #[test]
+    fn dispatch_health_action_returns_health_snapshot() {
+        // given
+        let registry = LspRegistry::new();
+        registry.register("rust", LspServerStatus::Disconnected, None, vec![]);
+        let _ = registry.dispatch("hover", Some("src/main.rs"), Some(1), Some(0), None);
+
+        // when
+        let health = registry
+            .dispatch("health", None, None, None, None)
+            .expect("health action should succeed");
+
+        // then
+        assert_eq!(health["action"], "health");
+        assert_eq!(health["health"]["rust"]["total_attempts"], 1);
+        assert_eq!(health["health"]["rust"]["total_failures"], 1);
+    }
+
+    fn temp_health_path(suffix: &str) -> std::path::PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "claw-lsp-health-{}-{}-{}",
+            std::process::id(),
+            suffix,
+            nanos
+        ));
+        std::fs::create_dir_all(&dir).expect("temp health directory should be created");
+        dir.join("lsp_health_state.json")
+    }
+
+    fn cleanup_temp_health_path(path: &std::path::Path) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
     }
 }
