@@ -11,10 +11,11 @@ Last updated: 2026-04-09
 - Slice 3 (2026-04-09): Rust turn-loop reliability now includes deterministic `tool_loop_stalled` / `no_progress_stalled` stop reasons, bounded repetition guards, and pre-turn budget/auto-compaction safeguards.
 - Slice 4 (2026-04-09): Rust LSP path now persists and reloads health telemetry in `.port_sessions/lsp_health_state.json`, enforces cooldown-backed retry suppression, and exposes `health`/`status` inspection via the Rust LSP tool surface.
 - Slice 5 (2026-04-09): Rust CLI UX now reports richer pre-turn statusline context (`pressure`, utilization %, messages/turns/session), and slash parity now includes `/runs` alias plus numeric `/checkpoint <limit>` shorthand.
+- Slice 6 (2026-04-09): Test hardening now covers Rust LSP health persistence path/telemetry updates at tool level, and migration docs now explicitly mark Python as compatibility fallback only for AFK behavior.
 
 ### Next
 
-- Slice 6: test hardening + docs updates + Python compatibility cleanup notes.
+- Post-slice migration hardening (history-based reliability tuning + remaining Rust parity gaps).
 
 ## Priority Backlog
 

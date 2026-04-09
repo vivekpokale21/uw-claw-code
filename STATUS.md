@@ -69,9 +69,20 @@ Last updated: 2026-04-09
   - new statusline formatter pressure thresholds
   - slash alias + checkpoint shorthand parser behavior
 
+### Slice 6 — Test hardening + Python compatibility cleanup notes (2026-04-09)
+
+- Added Rust tool-level regression coverage for LSP health persistence contract:
+  - verifies `LSP` tool emits `lsp_health_state_path`
+  - verifies `.port_sessions/lsp_health_state.json` is written
+  - verifies repeated failing dispatch updates persisted `health.rust.total_failures`
+- Migration policy is now explicitly documented as Rust-primary / Python-fallback:
+  - primary AFK workflow behavior remains on Rust path
+  - Python path is compatibility-only where parity is incomplete
+  - no new Python-first AFK feature development unless Rust path is blocked
+
 ## Current Status
 
-Slice 5 of Claude Code workflow reconstruction for AFK reliability is now implemented on top of
+Slice 6 of Claude Code workflow reconstruction for AFK reliability is now implemented on top of
 `llama.cpp + qwen3.5:4b`.
 
 Background framing for continuity:

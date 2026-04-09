@@ -25,6 +25,9 @@
   - Rust interactive pre-turn statusline now reports utilization %, pressure level, message/turn counters, and compact session id context.
   - Slash command parsing now accepts `/runs [limit]` as an alias for `/list-runs [limit]`.
   - Slash command parsing now treats `/checkpoint <limit>` as `/checkpoint list <limit>` for quick run-index inspection.
+- 2026-04-09 — Slice 6 complete:
+  - Added tool-level Rust regression coverage for persisted LSP health state output/path updates.
+  - Migration docs now explicitly mark Python runtime behavior as compatibility fallback while Rust remains the primary AFK path.
 
 ## Goal
 

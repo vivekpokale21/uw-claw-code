@@ -5491,6 +5491,59 @@ mod tests {
     }
 
     #[test]
+    fn lsp_tool_persists_health_state_and_reports_path() {
+        let _guard = env_lock().lock().expect("env lock");
+        let workspace = temp_path("lsp-health-state");
+        std::fs::create_dir_all(&workspace).expect("workspace should be created");
+        let health_path = workspace.join(".port_sessions").join("lsp_health_state.json");
+        let previous_cwd = std::env::current_dir().expect("cwd");
+        let previous_override = std::env::var_os("LSP_HEALTH_STATE_FILE");
+
+        std::env::set_var("LSP_HEALTH_STATE_FILE", &health_path);
+        std::env::set_current_dir(&workspace).expect("set current dir");
+
+        let health_result = execute_tool("LSP", &json!({ "action": "health" }))
+            .expect("health action should succeed");
+        let health_output: serde_json::Value =
+            serde_json::from_str(&health_result).expect("health output should be valid json");
+        assert_eq!(health_output["action"], "health");
+        assert_eq!(
+            health_output["lsp_health_state_path"],
+            health_path.display().to_string()
+        );
+        assert!(health_path.exists(), "health file should be persisted");
+
+        let hover_result = execute_tool(
+            "LSP",
+            &json!({ "action": "hover", "path": "src/main.rs", "line": 1, "character": 0 }),
+        )
+        .expect("hover action should return structured payload");
+        let hover_output: serde_json::Value =
+            serde_json::from_str(&hover_result).expect("hover output should be valid json");
+        assert_eq!(hover_output["status"], "error");
+        assert_eq!(
+            hover_output["lsp_health_state_path"],
+            health_path.display().to_string()
+        );
+        let persisted_payload = std::fs::read_to_string(&health_path).expect("health file readable");
+        let persisted_json: serde_json::Value =
+            serde_json::from_str(&persisted_payload).expect("persisted payload should parse");
+        assert!(
+            persisted_json["health"]["rust"]["total_failures"]
+                .as_u64()
+                .unwrap_or(0)
+                >= 1
+        );
+
+        std::env::set_current_dir(previous_cwd).expect("restore cwd");
+        match previous_override {
+            Some(value) => std::env::set_var("LSP_HEALTH_STATE_FILE", value),
+            None => std::env::remove_var("LSP_HEALTH_STATE_FILE"),
+        }
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
     fn worker_tools_gate_prompt_delivery_until_ready_and_support_auto_trust() {
         let created = execute_tool(
             "WorkerCreate",
