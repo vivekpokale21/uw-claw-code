@@ -2343,7 +2343,17 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
         match resolve_session_reference(&session_path.display().to_string()) {
             Ok(handle) => handle.path,
             Err(error) => {
-                eprintln!("failed to restore session: {error}");
+                if output_format == CliOutputFormat::Json {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "type": "error",
+                            "error": format!("failed to restore session: {error}"),
+                        })
+                    );
+                } else {
+                    eprintln!("failed to restore session: {error}");
+                }
                 std::process::exit(1);
             }
         }
@@ -2352,7 +2362,17 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
     let session = match Session::load_from_path(&resolved_path) {
         Ok(session) => session,
         Err(error) => {
-            eprintln!("failed to restore session: {error}");
+            if output_format == CliOutputFormat::Json {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "type": "error",
+                        "error": format!("failed to restore session: {error}"),
+                    })
+                );
+            } else {
+                eprintln!("failed to restore session: {error}");
+            }
             std::process::exit(1);
         }
     };
