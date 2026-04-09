@@ -2821,7 +2821,12 @@ fn run_resume_command(
             Ok(ResumeCommandOutcome {
                 session: result.compacted_session,
                 message: Some(format_compact_report(removed, kept, skipped)),
-                json: None,
+                json: Some(serde_json::json!({
+                    "kind": "compact",
+                    "skipped": skipped,
+                    "removed_messages": removed,
+                    "kept_messages": kept,
+                })),
             })
         }
         SlashCommand::Clear { confirm } => {
@@ -2831,7 +2836,11 @@ fn run_resume_command(
                     message: Some(
                         "clear: confirmation required; rerun with /clear --confirm".to_string(),
                     ),
-                    json: None,
+                    json: Some(serde_json::json!({
+                        "kind": "error",
+                        "error": "confirmation required",
+                        "hint": "rerun with /clear --confirm",
+                    })),
                 });
             }
             let backup_path = write_session_clear_backup(session, session_path)?;
@@ -2847,7 +2856,13 @@ fn run_resume_command(
                     backup_path.display(),
                     session_path.display()
                 )),
-                json: None,
+                json: Some(serde_json::json!({
+                    "kind": "clear",
+                    "previous_session_id": previous_session_id,
+                    "new_session_id": new_session_id,
+                    "backup": backup_path.display().to_string(),
+                    "session_file": session_path.display().to_string(),
+                })),
             })
         }
         SlashCommand::Status => {
