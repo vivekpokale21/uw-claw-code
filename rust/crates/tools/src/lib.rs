@@ -31,6 +31,8 @@ use runtime::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+mod semantic_search;
+
 /// Global task registry shared across tool invocations within a session.
 fn global_lsp_registry() -> &'static LspRegistry {
     use std::sync::OnceLock;
@@ -219,6 +221,8 @@ impl GlobalToolRegistry {
             ("edit", "edit_file"),
             ("glob", "glob_search"),
             ("grep", "grep_search"),
+            ("semantic", "SemanticSearch"),
+            ("semantic_search", "SemanticSearch"),
         ] {
             name_map.insert(alias.to_string(), canonical.to_string());
         }
@@ -465,8 +469,34 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
+            name: "SemanticSearch",
+            description:
+                "Search repository code semantically (preferred for discovery) with optional embedding reranking and index caching.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "path": { "type": "string" },
+                    "max_results": { "type": "integer", "minimum": 1 },
+                    "max_file_size_bytes": { "type": "integer", "minimum": 1024 },
+                    "chunk_lines": { "type": "integer", "minimum": 10 },
+                    "chunk_overlap_lines": { "type": "integer", "minimum": 0 },
+                    "extensions": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "reindex": { "type": "boolean" },
+                    "use_embeddings": { "type": "boolean" }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
             name: "grep_search",
-            description: "Search file contents with a regex pattern.",
+            description:
+                "Search file contents with a regex pattern (exact/fallback search when semantic retrieval is insufficient).",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1211,6 +1241,9 @@ fn execute_tool_with_enforcer(
         "Skill" => from_value::<SkillInput>(input).and_then(run_skill),
         "Agent" => from_value::<AgentInput>(input).and_then(run_agent),
         "ToolSearch" => from_value::<ToolSearchInput>(input).and_then(run_tool_search),
+        "SemanticSearch" => {
+            from_value::<semantic_search::SemanticSearchInput>(input).and_then(run_semantic_search)
+        }
         "NotebookEdit" => from_value::<NotebookEditInput>(input).and_then(run_notebook_edit),
         "Sleep" => from_value::<SleepInput>(input).and_then(run_sleep),
         "SendUserMessage" | "Brief" => from_value::<BriefInput>(input).and_then(run_brief),
@@ -2020,6 +2053,10 @@ fn run_agent(input: AgentInput) -> Result<String, String> {
 
 fn run_tool_search(input: ToolSearchInput) -> Result<String, String> {
     to_pretty_json(execute_tool_search(input))
+}
+
+fn run_semantic_search(input: semantic_search::SemanticSearchInput) -> Result<String, String> {
+    to_pretty_json(semantic_search::execute_semantic_search(input)?)
 }
 
 fn run_notebook_edit(input: NotebookEditInput) -> Result<String, String> {
@@ -5469,6 +5506,7 @@ mod tests {
         assert!(names.contains(&"Skill"));
         assert!(names.contains(&"Agent"));
         assert!(names.contains(&"ToolSearch"));
+        assert!(names.contains(&"SemanticSearch"));
         assert!(names.contains(&"NotebookEdit"));
         assert!(names.contains(&"Sleep"));
         assert!(names.contains(&"SendUserMessage"));
@@ -5495,7 +5533,9 @@ mod tests {
         let _guard = env_lock().lock().expect("env lock");
         let workspace = temp_path("lsp-health-state");
         std::fs::create_dir_all(&workspace).expect("workspace should be created");
-        let health_path = workspace.join(".port_sessions").join("lsp_health_state.json");
+        let health_path = workspace
+            .join(".port_sessions")
+            .join("lsp_health_state.json");
         let previous_cwd = std::env::current_dir().expect("cwd");
         let previous_override = std::env::var_os("LSP_HEALTH_STATE_FILE");
 
@@ -5525,7 +5565,8 @@ mod tests {
             hover_output["lsp_health_state_path"],
             health_path.display().to_string()
         );
-        let persisted_payload = std::fs::read_to_string(&health_path).expect("health file readable");
+        let persisted_payload =
+            std::fs::read_to_string(&health_path).expect("health file readable");
         let persisted_json: serde_json::Value =
             serde_json::from_str(&persisted_payload).expect("persisted payload should parse");
         assert!(
@@ -7012,6 +7053,35 @@ mod tests {
             serde_json::from_str(&selected_with_alias).expect("valid json");
         assert_eq!(selected_with_alias_output["matches"][0], "Agent");
         assert_eq!(selected_with_alias_output["matches"][1], "Skill");
+    }
+
+    #[test]
+    fn semantic_search_tool_returns_matches() {
+        let root = temp_path("semantic-search-tool");
+        std::fs::create_dir_all(root.join("src")).expect("create src dir");
+        std::fs::write(
+            root.join("src").join("api.py"),
+            "def endpoint():\n    # apply request rate limit\n    pass\n",
+        )
+        .expect("write api file");
+
+        let result = execute_tool(
+            "SemanticSearch",
+            &json!({
+                "query": "request rate limit endpoint",
+                "path": root.display().to_string(),
+                "max_results": 3,
+                "use_embeddings": false,
+                "reindex": true
+            }),
+        )
+        .expect("SemanticSearch should succeed");
+        let payload: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        let matches = payload["results"].as_array().expect("results array");
+        assert!(!matches.is_empty(), "expected at least one semantic match");
+        assert_eq!(matches[0]["path"], "src/api.py");
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

@@ -5,7 +5,7 @@ use serde_json::{Map, Value};
 use telemetry::SessionTracer;
 
 use crate::compact::{
-    CompactionConfig, CompactionResult, compact_session, estimate_session_tokens,
+    compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
 };
 use crate::config::RuntimeFeatureConfig;
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
@@ -21,6 +21,32 @@ const DEFAULT_TOOL_LOOP_STALL_LIMIT: usize = 4;
 const DEFAULT_NO_PROGRESS_STALL_LIMIT: usize = 3;
 const TOOL_LOOP_STALL_LIMIT_ENV_VAR: &str = "CLAW_TOOL_LOOP_STALL_LIMIT";
 const NO_PROGRESS_STALL_LIMIT_ENV_VAR: &str = "CLAW_NO_PROGRESS_STALL_LIMIT";
+const RETRIEVAL_REQUIRED_STOP_REASON: &str = "stop_reason=retrieval_required";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RetrievalScope {
+    Path(String),
+    Prefix(String),
+    Global,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RetrievalEvidence {
+    source_tool: String,
+    scope: RetrievalScope,
+}
+
+impl RetrievalEvidence {
+    fn matches_target(&self, target_path: &str) -> bool {
+        match &self.scope {
+            RetrievalScope::Path(path) => path == target_path,
+            RetrievalScope::Prefix(prefix) => {
+                target_path == prefix || target_path.starts_with(&format!("{prefix}/"))
+            }
+            RetrievalScope::Global => true,
+        }
+    }
+}
 
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,6 +168,7 @@ pub struct ConversationRuntime<C, T> {
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     session_tracer: Option<SessionTracer>,
+    retrieval_evidence: Vec<RetrievalEvidence>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -178,6 +205,7 @@ where
         feature_config: &RuntimeFeatureConfig,
     ) -> Self {
         let usage_tracker = UsageTracker::from_session(&session);
+        let retrieval_evidence = collect_retrieval_evidence_from_session(&session);
         Self {
             session,
             api_client,
@@ -193,6 +221,7 @@ where
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
             session_tracer: None,
+            retrieval_evidence,
         }
     }
 
@@ -451,6 +480,10 @@ where
                             &format!("PreToolUse hook denied tool `{tool_name}`"),
                         ),
                     }
+                } else if let Some(reason) =
+                    self.retrieval_requirement_error(&tool_name, &effective_input)
+                {
+                    PermissionOutcome::Deny { reason }
                 } else if let Some(prompt) = prompter.as_mut() {
                     self.permission_policy.authorize_with_context(
                         &tool_name,
@@ -504,6 +537,9 @@ where
                                 || post_hook_result.is_failed()
                                 || post_hook_result.is_cancelled(),
                         );
+                        if !is_error {
+                            self.record_retrieval_evidence(&tool_name, &effective_input);
+                        }
 
                         ConversationMessage::tool_result(tool_use_id, tool_name, output, is_error)
                     }
@@ -535,6 +571,38 @@ where
         self.record_turn_completed(&summary);
 
         Ok(summary)
+    }
+
+    fn retrieval_requirement_error(&self, tool_name: &str, input: &str) -> Option<String> {
+        if !requires_retrieval_evidence(tool_name) {
+            return None;
+        }
+
+        let Some(target_path) = extract_target_path_for_write_like_tool(input) else {
+            return Some(format!(
+                "{RETRIEVAL_REQUIRED_STOP_REASON} tool `{tool_name}` requires a `path` field and prior retrieval evidence (read_file, SemanticSearch, grep_search, glob_search, or LSP)"
+            ));
+        };
+        if self
+            .retrieval_evidence
+            .iter()
+            .any(|evidence| evidence.matches_target(&target_path))
+        {
+            return None;
+        }
+
+        Some(format!(
+            "{RETRIEVAL_REQUIRED_STOP_REASON} tool `{tool_name}` requires prior retrieval evidence (read_file, SemanticSearch, grep_search, glob_search, or LSP) for `{target_path}`"
+        ))
+    }
+
+    fn record_retrieval_evidence(&mut self, tool_name: &str, input: &str) {
+        let Some(evidence) = extract_retrieval_evidence(tool_name, input) else {
+            return;
+        };
+        if !self.retrieval_evidence.contains(&evidence) {
+            self.retrieval_evidence.push(evidence);
+        }
     }
 
     #[must_use]
@@ -760,6 +828,143 @@ fn tool_plan_signature(tool_uses: &[(String, String, String)]) -> String {
         .join("\u{1e}")
 }
 
+fn collect_retrieval_evidence_from_session(session: &Session) -> Vec<RetrievalEvidence> {
+    let mut pending_uses = BTreeMap::<String, (String, String)>::new();
+    let mut evidence = Vec::new();
+
+    for message in &session.messages {
+        match message.role {
+            crate::session::MessageRole::Assistant => {
+                for block in &message.blocks {
+                    if let ContentBlock::ToolUse { id, name, input } = block {
+                        pending_uses.insert(id.clone(), (name.clone(), input.clone()));
+                    }
+                }
+            }
+            crate::session::MessageRole::Tool => {
+                for block in &message.blocks {
+                    let ContentBlock::ToolResult {
+                        tool_use_id,
+                        is_error,
+                        ..
+                    } = block
+                    else {
+                        continue;
+                    };
+                    if *is_error {
+                        continue;
+                    }
+                    let Some((name, input)) = pending_uses.remove(tool_use_id) else {
+                        continue;
+                    };
+                    let Some(item) = extract_retrieval_evidence(&name, &input) else {
+                        continue;
+                    };
+                    if !evidence.contains(&item) {
+                        evidence.push(item);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    evidence
+}
+
+fn requires_retrieval_evidence(tool_name: &str) -> bool {
+    matches!(
+        normalize_tool_name(tool_name).as_str(),
+        "write_file" | "edit_file" | "write" | "edit"
+    )
+}
+
+fn extract_target_path_for_write_like_tool(input: &str) -> Option<String> {
+    extract_input_string_field(input, "path").map(|value| normalize_path(&value))
+}
+
+fn extract_retrieval_evidence(tool_name: &str, input: &str) -> Option<RetrievalEvidence> {
+    let normalized = normalize_tool_name(tool_name);
+    match normalized.as_str() {
+        "read_file" | "read" => {
+            extract_input_string_field(input, "path").map(|path| RetrievalEvidence {
+                source_tool: normalized,
+                scope: RetrievalScope::Path(normalize_path(&path)),
+            })
+        }
+        "grep_search" | "grep" | "glob_search" | "glob" => {
+            let scope = extract_input_string_field(input, "path")
+                .map(|path| normalize_scope_path(&path))
+                .unwrap_or_else(|| ".".to_string());
+            let scope = if scope == "." || scope.is_empty() {
+                RetrievalScope::Global
+            } else {
+                RetrievalScope::Prefix(scope)
+            };
+            Some(RetrievalEvidence {
+                source_tool: normalized,
+                scope,
+            })
+        }
+        "semanticsearch" | "semantic_search" | "semantic" => {
+            let scope = extract_input_string_field(input, "path")
+                .map(|path| normalize_scope_path(&path))
+                .unwrap_or_else(|| ".".to_string());
+            let scope = if scope == "." || scope.is_empty() {
+                RetrievalScope::Global
+            } else {
+                RetrievalScope::Prefix(scope)
+            };
+            Some(RetrievalEvidence {
+                source_tool: normalized,
+                scope,
+            })
+        }
+        "lsp" => {
+            let action = extract_input_string_field(input, "action")
+                .map(|value| value.to_ascii_lowercase())
+                .unwrap_or_default();
+            if matches!(action.as_str(), "health" | "status") {
+                return None;
+            }
+            extract_input_string_field(input, "path").map(|path| RetrievalEvidence {
+                source_tool: normalized,
+                scope: RetrievalScope::Path(normalize_path(&path)),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn extract_input_string_field(input: &str, field: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(input).ok()?;
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn normalize_tool_name(tool_name: &str) -> String {
+    tool_name.trim().to_ascii_lowercase()
+}
+
+fn normalize_path(path: &str) -> String {
+    path.trim()
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .to_string()
+}
+
+fn normalize_scope_path(path: &str) -> String {
+    let normalized = normalize_path(path);
+    if normalized == "." || normalized.is_empty() {
+        ".".to_string()
+    } else {
+        normalized.trim_end_matches('/').to_string()
+    }
+}
+
 fn build_assistant_message(
     events: Vec<AssistantEvent>,
 ) -> Result<
@@ -879,12 +1084,11 @@ impl ToolExecutor for StaticToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
+        build_assistant_message, parse_auto_compaction_threshold, parse_positive_usize_limit,
         ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent, ConversationRuntime,
-        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD, PromptCacheEvent, RuntimeError,
-        StaticToolExecutor, ToolExecutor, build_assistant_message, parse_auto_compaction_threshold,
-        parse_positive_usize_limit,
+        PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolExecutor,
+        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
-    use crate::ToolError;
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
     use crate::permissions::{
@@ -892,8 +1096,9 @@ mod tests {
         PermissionRequest,
     };
     use crate::prompt::{ProjectContext, SystemPromptBuilder};
-    use crate::session::{ContentBlock, MessageRole, Session};
+    use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
     use crate::usage::TokenUsage;
+    use crate::ToolError;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -909,12 +1114,10 @@ mod tests {
             self.call_count += 1;
             match self.call_count {
                 1 => {
-                    assert!(
-                        request
-                            .messages
-                            .iter()
-                            .any(|message| message.role == MessageRole::User)
-                    );
+                    assert!(request
+                        .messages
+                        .iter()
+                        .any(|message| message.role == MessageRole::User));
                     Ok(vec![
                         AssistantEvent::TextDelta("Let me calculate that.".to_string()),
                         AssistantEvent::ToolUse {
@@ -1258,12 +1461,10 @@ mod tests {
                         AssistantEvent::MessageStop,
                     ]),
                     2 => {
-                        assert!(
-                            request
-                                .messages
-                                .iter()
-                                .any(|message| message.role == MessageRole::Tool)
-                        );
+                        assert!(request
+                            .messages
+                            .iter()
+                            .any(|message| message.role == MessageRole::Tool));
                         Ok(vec![
                             AssistantEvent::TextDelta("done".to_string()),
                             AssistantEvent::MessageStop,
@@ -1335,12 +1536,10 @@ mod tests {
                         AssistantEvent::MessageStop,
                     ]),
                     2 => {
-                        assert!(
-                            request
-                                .messages
-                                .iter()
-                                .any(|message| message.role == MessageRole::Tool)
-                        );
+                        assert!(request
+                            .messages
+                            .iter()
+                            .any(|message| message.role == MessageRole::Tool));
                         Ok(vec![
                             AssistantEvent::TextDelta("done".to_string()),
                             AssistantEvent::MessageStop,
@@ -1693,11 +1892,9 @@ mod tests {
             .expect_err("assistant messages should require a stop event");
 
         // then
-        assert!(
-            error
-                .to_string()
-                .contains("assistant stream ended without a message stop event")
-        );
+        assert!(error
+            .to_string()
+            .contains("assistant stream ended without a message stop event"));
     }
 
     #[test]
@@ -1710,11 +1907,9 @@ mod tests {
             build_assistant_message(events).expect_err("assistant messages should require content");
 
         // then
-        assert!(
-            error
-                .to_string()
-                .contains("assistant stream produced no content")
-        );
+        assert!(error
+            .to_string()
+            .contains("assistant stream produced no content"));
     }
 
     #[test]
@@ -1767,11 +1962,9 @@ mod tests {
             .expect_err("conversation loop should stop after the configured limit");
 
         // then
-        assert!(
-            error
-                .to_string()
-                .contains("conversation loop exceeded the maximum number of iterations")
-        );
+        assert!(error
+            .to_string()
+            .contains("conversation loop exceeded the maximum number of iterations"));
     }
 
     #[test]
@@ -1847,11 +2040,9 @@ mod tests {
             .run_turn("loop", None)
             .expect_err("turn should stop when no forward progress is detected");
 
-        assert!(
-            error
-                .to_string()
-                .contains("stop_reason=no_progress_stalled")
-        );
+        assert!(error
+            .to_string()
+            .contains("stop_reason=no_progress_stalled"));
     }
 
     #[test]
@@ -1883,5 +2074,294 @@ mod tests {
 
         // then
         assert_eq!(error.to_string(), "upstream failed");
+    }
+
+    #[test]
+    fn denies_write_without_retrieval_evidence() {
+        struct TwoCallApi {
+            calls: usize,
+        }
+
+        impl ApiClient for TwoCallApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                match self.calls {
+                    1 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-write".to_string(),
+                            name: "write_file".to_string(),
+                            input: r#"{"path":"src/main.rs","content":"fn main() {}\n"}"#
+                                .to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    2 => {
+                        assert!(request
+                            .messages
+                            .iter()
+                            .any(|message| message.role == MessageRole::Tool));
+                        Ok(vec![
+                            AssistantEvent::TextDelta("done".to_string()),
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    _ => unreachable!("extra API call"),
+                }
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            TwoCallApi { calls: 0 },
+            StaticToolExecutor::new().register("write_file", |_input| {
+                panic!("write_file should not execute without retrieval evidence")
+            }),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn("write without retrieval", None)
+            .expect("conversation should continue after gated write");
+
+        assert_eq!(summary.tool_results.len(), 1);
+        let ContentBlock::ToolResult {
+            is_error, output, ..
+        } = &summary.tool_results[0].blocks[0]
+        else {
+            panic!("expected tool result block");
+        };
+        assert!(*is_error);
+        assert!(output.contains("stop_reason=retrieval_required"));
+        assert!(output.contains("write_file"));
+    }
+
+    #[test]
+    fn allows_write_after_read_retrieval_in_same_turn() {
+        struct TwoCallApi {
+            calls: usize,
+        }
+
+        impl ApiClient for TwoCallApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                match self.calls {
+                    1 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-read".to_string(),
+                            name: "read_file".to_string(),
+                            input: r#"{"path":"src/main.rs"}"#.to_string(),
+                        },
+                        AssistantEvent::ToolUse {
+                            id: "tool-write".to_string(),
+                            name: "write_file".to_string(),
+                            input: r#"{"path":"src/main.rs","content":"fn main() { println!(\"ok\"); }\n"}"#.to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    2 => {
+                        assert!(
+                            request
+                                .messages
+                                .iter()
+                                .any(|message| message.role == MessageRole::Tool)
+                        );
+                        Ok(vec![
+                            AssistantEvent::TextDelta("done".to_string()),
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    _ => unreachable!("extra API call"),
+                }
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            TwoCallApi { calls: 0 },
+            StaticToolExecutor::new()
+                .register("read_file", |_input| Ok("fn main() {}\n".to_string()))
+                .register("write_file", |_input| Ok("wrote src/main.rs".to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn("read then write", None)
+            .expect("conversation should succeed");
+
+        assert_eq!(summary.tool_results.len(), 2);
+        let ContentBlock::ToolResult {
+            is_error: read_error,
+            ..
+        } = &summary.tool_results[0].blocks[0]
+        else {
+            panic!("expected first tool result");
+        };
+        assert!(!*read_error);
+        let ContentBlock::ToolResult {
+            is_error: write_error,
+            output,
+            ..
+        } = &summary.tool_results[1].blocks[0]
+        else {
+            panic!("expected second tool result");
+        };
+        assert!(!*write_error, "write should be allowed after retrieval");
+        assert!(output.contains("wrote src/main.rs"));
+    }
+
+    #[test]
+    fn allows_write_after_semantic_search_retrieval_in_same_turn() {
+        struct TwoCallApi {
+            calls: usize,
+        }
+
+        impl ApiClient for TwoCallApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                match self.calls {
+                    1 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-semantic".to_string(),
+                            name: "SemanticSearch".to_string(),
+                            input: r#"{"query":"entrypoint","path":"src"}"#.to_string(),
+                        },
+                        AssistantEvent::ToolUse {
+                            id: "tool-write".to_string(),
+                            name: "write_file".to_string(),
+                            input: r#"{"path":"src/main.rs","content":"fn main() { println!(\"ok\"); }\n"}"#.to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    2 => {
+                        assert!(
+                            request
+                                .messages
+                                .iter()
+                                .any(|message| message.role == MessageRole::Tool)
+                        );
+                        Ok(vec![
+                            AssistantEvent::TextDelta("done".to_string()),
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    _ => unreachable!("extra API call"),
+                }
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            TwoCallApi { calls: 0 },
+            StaticToolExecutor::new()
+                .register("SemanticSearch", |_input| Ok("{\"results\":[]}".to_string()))
+                .register("write_file", |_input| Ok("wrote src/main.rs".to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn("semantic then write", None)
+            .expect("conversation should succeed");
+
+        assert_eq!(summary.tool_results.len(), 2);
+        let ContentBlock::ToolResult {
+            is_error: semantic_error,
+            ..
+        } = &summary.tool_results[0].blocks[0]
+        else {
+            panic!("expected first tool result");
+        };
+        assert!(!*semantic_error);
+        let ContentBlock::ToolResult {
+            is_error: write_error,
+            output,
+            ..
+        } = &summary.tool_results[1].blocks[0]
+        else {
+            panic!("expected second tool result");
+        };
+        assert!(
+            !*write_error,
+            "write should be allowed after semantic retrieval"
+        );
+        assert!(output.contains("wrote src/main.rs"));
+    }
+
+    #[test]
+    fn allows_edit_when_retrieval_evidence_exists_in_prior_session_history() {
+        struct TwoCallApi {
+            calls: usize,
+        }
+
+        impl ApiClient for TwoCallApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                match self.calls {
+                    1 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-edit".to_string(),
+                            name: "edit_file".to_string(),
+                            input: r#"{"path":"src/lib.rs","old_string":"foo","new_string":"bar"}"#
+                                .to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    2 => {
+                        assert!(request
+                            .messages
+                            .iter()
+                            .any(|message| message.role == MessageRole::Tool));
+                        Ok(vec![
+                            AssistantEvent::TextDelta("done".to_string()),
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    _ => unreachable!("extra API call"),
+                }
+            }
+        }
+
+        let mut session = Session::new();
+        session
+            .push_message(ConversationMessage::assistant(vec![
+                ContentBlock::ToolUse {
+                    id: "seed-read".to_string(),
+                    name: "read_file".to_string(),
+                    input: r#"{"path":"src/lib.rs"}"#.to_string(),
+                },
+            ]))
+            .expect("seed tool use");
+        session
+            .push_message(ConversationMessage::tool_result(
+                "seed-read",
+                "read_file",
+                "fn foo() {}\n",
+                false,
+            ))
+            .expect("seed tool result");
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            TwoCallApi { calls: 0 },
+            StaticToolExecutor::new().register("edit_file", |_input| Ok("edited".to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn("edit with prior retrieval evidence", None)
+            .expect("conversation should succeed");
+
+        assert_eq!(summary.tool_results.len(), 1);
+        let ContentBlock::ToolResult {
+            is_error, output, ..
+        } = &summary.tool_results[0].blocks[0]
+        else {
+            panic!("expected tool result block");
+        };
+        assert!(!*is_error);
+        assert!(output.contains("edited"));
     }
 }

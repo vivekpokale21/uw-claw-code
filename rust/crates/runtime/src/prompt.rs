@@ -2,9 +2,12 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::{ConfigError, ConfigLoader, RuntimeConfig};
 use crate::git_context::GitContext;
+use crate::lsp_client::LspRegistry;
+use walkdir::WalkDir;
 
 /// Errors raised while assembling the final system prompt.
 #[derive(Debug)]
@@ -42,6 +45,31 @@ pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str = "__SYSTEM_PROMPT_DYNAMIC_BOUNDA
 pub const FRONTIER_MODEL_NAME: &str = "Claude Opus 4.6";
 const MAX_INSTRUCTION_FILE_CHARS: usize = 4_000;
 const MAX_TOTAL_INSTRUCTION_CHARS: usize = 12_000;
+const REPO_MAP_MAX_DEPTH: usize = 4;
+const REPO_MAP_MAX_ENTRIES: usize = 120;
+const REPO_MAP_MAX_EXTENSION_ITEMS: usize = 8;
+const REPO_MAP_MAX_SECTION_CHARS: usize = 6_000;
+const REPO_MAP_SKIPPED_DIRS: &[&str] = &[
+    ".git",
+    ".claude",
+    ".claw",
+    ".port_sessions",
+    ".sandbox-home",
+    ".sandbox-tmp",
+    ".hg",
+    ".svn",
+    ".jj",
+    ".idea",
+    ".vscode",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "coverage",
+    "__pycache__",
+    ".venv",
+    "venv",
+];
 
 /// Contents of an instruction file included in prompt construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,6 +182,8 @@ impl SystemPromptBuilder {
         sections.push(self.environment_section());
         if let Some(project_context) = &self.project_context {
             sections.push(render_project_context(project_context));
+            sections.push(render_repository_map(&project_context.cwd));
+            sections.push(render_lsp_context(&project_context.cwd));
             if !project_context.instruction_files.is_empty() {
                 sections.push(render_instruction_files(&project_context.instruction_files));
             }
@@ -327,6 +357,204 @@ fn render_project_context(project_context: &ProjectContext) -> String {
     lines.join("\n")
 }
 
+#[derive(Debug, Default)]
+struct RepoMapSummary {
+    entries: Vec<String>,
+    extension_counts: std::collections::BTreeMap<String, usize>,
+    files_scanned: usize,
+    truncated: bool,
+}
+
+fn render_repository_map(cwd: &Path) -> String {
+    let summary = collect_repository_map(cwd);
+    let mut lines = vec!["# Repository map".to_string()];
+    lines.extend(prepend_bullets(vec![
+        format!("Workspace root: {}", cwd.display()),
+        format!("Entries shown: {}", summary.entries.len()),
+        format!("Files scanned: {}", summary.files_scanned),
+    ]));
+
+    if !summary.extension_counts.is_empty() {
+        let mut extensions = summary.extension_counts.iter().collect::<Vec<_>>();
+        extensions.sort_by(|left, right| right.1.cmp(left.1).then_with(|| left.0.cmp(right.0)));
+        let top_extensions = extensions
+            .into_iter()
+            .take(REPO_MAP_MAX_EXTENSION_ITEMS)
+            .map(|(key, count)| format!("{key}={count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(String::new());
+        lines.push(format!("Top file extensions: {top_extensions}"));
+    }
+
+    lines.push(String::new());
+    lines.push("Paths:".to_string());
+    if summary.entries.is_empty() {
+        lines.push("  (no readable workspace entries discovered)".to_string());
+    } else {
+        lines.extend(summary.entries.iter().map(|entry| format!("  {entry}")));
+        if summary.truncated {
+            lines.push("  ... (truncated)".to_string());
+        }
+    }
+
+    truncate_section(lines.join("\n"), REPO_MAP_MAX_SECTION_CHARS)
+}
+
+fn collect_repository_map(cwd: &Path) -> RepoMapSummary {
+    let mut summary = RepoMapSummary::default();
+
+    for entry in WalkDir::new(cwd)
+        .min_depth(1)
+        .max_depth(REPO_MAP_MAX_DEPTH)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        let path = entry.path();
+        if should_skip_repo_path(path, cwd) {
+            continue;
+        }
+
+        let relative = path
+            .strip_prefix(cwd)
+            .map_or_else(|_| path.to_path_buf(), Path::to_path_buf);
+        let mut rendered = relative.to_string_lossy().replace('\\', "/");
+        if entry.file_type().is_dir() {
+            rendered.push('/');
+        } else {
+            summary.files_scanned = summary.files_scanned.saturating_add(1);
+            let ext = relative
+                .extension()
+                .and_then(|value| value.to_str())
+                .map_or_else(|| "(none)".to_string(), |value| value.to_ascii_lowercase());
+            *summary.extension_counts.entry(ext).or_insert(0) += 1;
+        }
+
+        summary.entries.push(rendered);
+        if summary.entries.len() >= REPO_MAP_MAX_ENTRIES {
+            summary.truncated = true;
+            break;
+        }
+    }
+
+    summary
+}
+
+fn should_skip_repo_path(path: &Path, root: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    relative.components().any(|component| {
+        let name = component.as_os_str().to_string_lossy();
+        REPO_MAP_SKIPPED_DIRS
+            .iter()
+            .any(|ignored| ignored == &name.as_ref())
+    })
+}
+
+fn render_lsp_context(cwd: &Path) -> String {
+    let registry = LspRegistry::new();
+    let health_path = LspRegistry::default_health_state_path(Some(cwd));
+    let load_result = registry.load_health_from_path(&health_path);
+    let mut snapshot = registry.health_snapshot().into_iter().collect::<Vec<_>>();
+    snapshot.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut lines = vec!["# LSP context".to_string()];
+    lines.extend(prepend_bullets(vec![
+        format!("Health state path: {}", health_path.display()),
+        match load_result {
+            Ok(count) => format!("Health entries loaded: {count}"),
+            Err(error) => format!("Health load error: {error}"),
+        },
+        format!("Server availability: {}", render_lsp_server_availability()),
+    ]));
+
+    if snapshot.is_empty() {
+        lines.push(String::new());
+        lines.push("No persisted LSP health snapshot found for this workspace.".to_string());
+        return lines.join("\n");
+    }
+
+    lines.push(String::new());
+    lines.push("Health summary:".to_string());
+    let now = now_unix_seconds();
+    for (language, health) in snapshot {
+        let cooldown_remaining = (health.blocked_until_unix - now).max(0.0);
+        let last_error = if health.last_error.trim().is_empty() {
+            "none".to_string()
+        } else {
+            health.last_error.clone()
+        };
+        lines.push(format!(
+            "  - {language}: consecutive_failures={}, cooldown_remaining_seconds={cooldown_remaining:.1}, total_attempts={}, total_failures={}, last_error={last_error}, last_capabilities={}",
+            health.consecutive_failures,
+            health.total_attempts,
+            health.total_failures,
+            health.last_capabilities
+        ));
+    }
+
+    lines.join("\n")
+}
+
+fn truncate_section(section: String, max_chars: usize) -> String {
+    if section.chars().count() <= max_chars {
+        return section;
+    }
+    let mut output = section.chars().take(max_chars).collect::<String>();
+    output.push_str("\n\n[truncated]");
+    output
+}
+
+fn now_unix_seconds() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+fn render_lsp_server_availability() -> String {
+    let checks = [
+        ("rust", &["rust-analyzer"][..]),
+        ("python", &["pyright-langserver", "pylsp"][..]),
+        ("typescript", &["typescript-language-server"][..]),
+        ("go", &["gopls"][..]),
+    ];
+    checks
+        .into_iter()
+        .map(|(language, candidates)| {
+            let matched = candidates
+                .iter()
+                .find(|candidate| command_in_path(candidate))
+                .copied()
+                .unwrap_or("none");
+            format!("{language}={matched}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn command_in_path(command: &str) -> bool {
+    let Some(path_os) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path_os).any(|dir| {
+        let candidate = dir.join(command);
+        if candidate.is_file() {
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            let exe = dir.join(format!("{command}.exe"));
+            if exe.is_file() {
+                return true;
+            }
+        }
+        false
+    })
+}
+
 fn render_instruction_files(files: &[ContextFile]) -> String {
     let mut sections = vec!["# Claude instructions".to_string()];
     let mut remaining_chars = MAX_TOTAL_INSTRUCTION_CHARS;
@@ -496,6 +724,7 @@ fn get_simple_system_section() -> String {
 fn get_simple_doing_tasks_section() -> String {
     let items = prepend_bullets(vec![
         "Read relevant code before changing it and keep changes tightly scoped to the request.".to_string(),
+        "For codebase discovery, prefer SemanticSearch first; use grep_search as fallback for exact literal/regex matching when semantic recall is insufficient.".to_string(),
         "Do not add speculative abstractions, compatibility shims, or unrelated cleanup.".to_string(),
         "Do not create files unless they are required to complete the task.".to_string(),
         "If an approach fails, diagnose the failure before switching tactics.".to_string(),
@@ -901,5 +1130,70 @@ mod tests {
         assert!(rendered.contains("# Claude instructions"));
         assert!(rendered.contains("scope: /tmp/project"));
         assert!(rendered.contains("Project rules"));
+    }
+
+    #[test]
+    fn renders_repository_map_section_for_workspace() {
+        let root = temp_dir();
+        fs::create_dir_all(root.join("src")).expect("src dir");
+        fs::create_dir_all(root.join("docs")).expect("docs dir");
+        fs::write(root.join("src").join("main.rs"), "fn main() {}\n").expect("main file");
+        fs::write(root.join("docs").join("README.md"), "# Docs\n").expect("readme file");
+
+        let project_context =
+            ProjectContext::discover(&root, "2026-03-31").expect("context should load");
+        let prompt = SystemPromptBuilder::new()
+            .with_os("linux", "6.8")
+            .with_project_context(project_context)
+            .render();
+
+        assert!(prompt.contains("# Repository map"));
+        assert!(prompt.contains("src/main.rs"));
+        assert!(prompt.contains("docs/README.md"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn renders_lsp_context_from_workspace_health_snapshot() {
+        let root = temp_dir();
+        fs::create_dir_all(root.join(".port_sessions")).expect("state dir");
+        fs::write(
+            root.join(".port_sessions").join("lsp_health_state.json"),
+            r#"{
+  "version": 1,
+  "saved_unix": 1710000000,
+  "health": {
+    "python": {
+      "consecutive_failures": 2,
+      "blocked_until_unix": 1710000300,
+      "last_error": "startup failed",
+      "last_attempt_unix": 1710000000,
+      "last_success_unix": 0,
+      "total_attempts": 4,
+      "total_failures": 2,
+      "last_warning": "",
+      "last_capabilities": "definition,references",
+      "last_failure_kind": "startup",
+      "recent_crash_loops": 1
+    }
+  }
+}"#,
+        )
+        .expect("write health");
+
+        let project_context =
+            ProjectContext::discover(&root, "2026-03-31").expect("context should load");
+        let prompt = SystemPromptBuilder::new()
+            .with_os("linux", "6.8")
+            .with_project_context(project_context)
+            .render();
+
+        assert!(prompt.contains("# LSP context"));
+        assert!(prompt.contains("python"));
+        assert!(prompt.contains("consecutive_failures=2"));
+        assert!(prompt.contains("last_error=startup failed"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 }

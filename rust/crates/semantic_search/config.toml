@@ -1,0 +1,36 @@
+[llamacpp]
+base_url = "http://localhost:8080"
+embed_endpoint = "/embedding"
+completion_endpoint = "/completion"
+rerank_endpoint = "/reranking"
+embed_model = "nomic-embed-text-v1.5"
+hyde_model = "qwen2.5-coder"
+rerank_model = "bge-reranker-base"
+request_timeout_secs = 30
+batch_size = 32
+vector_size = 768
+
+[qdrant]
+mode = "memory"
+url = "http://localhost:6333"
+collection = "codebase"
+persist_path = ".semantic_search/qdrant"
+vector_size = 768
+
+[bm25]
+persist_path = ".semantic_search/bm25.bin"
+k1 = 1.5
+b = 0.75
+
+[chunker]
+target_tokens = 512
+overlap_tokens = 50
+extensions = [".go", ".py", ".ts", ".tsx", ".js", ".md", ".yaml", ".toml"]
+
+[retrieval]
+top_k = 20
+rrf_k = 60
+use_hyde = true
+use_rerank = true
+top_n = 8
+max_tokens = 4096

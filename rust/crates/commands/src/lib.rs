@@ -6,10 +6,10 @@ use std::path::{Path, PathBuf};
 
 use plugins::{PluginError, PluginManager, PluginSummary};
 use runtime::{
-    CompactionConfig, ConfigLoader, ConfigSource, McpOAuthConfig, McpServerConfig,
-    ScopedMcpServerConfig, Session, compact_session,
+    compact_session, CompactionConfig, ConfigLoader, ConfigSource, McpOAuthConfig, McpServerConfig,
+    ScopedMcpServerConfig, Session,
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandManifestEntry {
@@ -4109,14 +4109,14 @@ pub fn handle_slash_command(
 #[cfg(test)]
 mod tests {
     use super::{
-        DefinitionSource, SkillOrigin, SkillRoot, SkillSlashDispatch, SlashCommand,
         classify_skills_slash_command, handle_agents_slash_command_json,
         handle_plugins_slash_command, handle_skills_slash_command_json, handle_slash_command,
         load_agents_from_roots, load_skills_from_roots, render_agents_report,
         render_agents_report_json, render_mcp_report_json_for, render_plugins_report,
         render_skills_report, render_slash_command_help, render_slash_command_help_detail,
         resolve_skill_path, resume_supported_slash_commands, slash_command_specs,
-        suggest_slash_commands, validate_slash_command_input,
+        suggest_slash_commands, validate_slash_command_input, DefinitionSource, SkillOrigin,
+        SkillRoot, SkillSlashDispatch, SlashCommand,
     };
     use plugins::{PluginKind, PluginManager, PluginManagerConfig, PluginMetadata, PluginSummary};
     use runtime::{
@@ -4598,10 +4598,8 @@ mod tests {
         assert!(show_error.contains("  Usage            /mcp show <server>"));
 
         let action_error = parse_error_message("/mcp inspect alpha");
-        assert!(
-            action_error
-                .contains("Unknown /mcp action 'inspect'. Use list, show <server>, or help.")
-        );
+        assert!(action_error
+            .contains("Unknown /mcp action 'inspect'. Use list, show <server>, or help."));
         assert!(action_error.contains("  Usage            /mcp [list|show <server>|help]"));
     }
 
@@ -4679,9 +4677,7 @@ mod tests {
 
         assert!(help.contains("Keyboard shortcuts"));
         assert!(help.contains("Up/Down              Navigate prompt history"));
-        assert!(
-            help.contains("Tab                  Complete commands, modes, and recent sessions")
-        );
+        assert!(help.contains("Tab                  Complete commands, modes, and recent sessions"));
         assert!(help.contains("Ctrl-C               Clear input (or exit on empty prompt)"));
         assert!(help.contains("Shift+Enter/Ctrl+J   Insert a newline"));
 
@@ -4821,36 +4817,30 @@ mod tests {
         assert!(
             handle_slash_command("/model claude", &session, CompactionConfig::default()).is_none()
         );
-        assert!(
-            handle_slash_command(
-                "/permissions read-only",
-                &session,
-                CompactionConfig::default()
-            )
-            .is_none()
-        );
+        assert!(handle_slash_command(
+            "/permissions read-only",
+            &session,
+            CompactionConfig::default()
+        )
+        .is_none());
         assert!(handle_slash_command("/clear", &session, CompactionConfig::default()).is_none());
         assert!(
             handle_slash_command("/clear --confirm", &session, CompactionConfig::default())
                 .is_none()
         );
         assert!(handle_slash_command("/cost", &session, CompactionConfig::default()).is_none());
-        assert!(
-            handle_slash_command(
-                "/resume session.json",
-                &session,
-                CompactionConfig::default()
-            )
-            .is_none()
-        );
-        assert!(
-            handle_slash_command(
-                "/resume session.jsonl",
-                &session,
-                CompactionConfig::default()
-            )
-            .is_none()
-        );
+        assert!(handle_slash_command(
+            "/resume session.json",
+            &session,
+            CompactionConfig::default()
+        )
+        .is_none());
+        assert!(handle_slash_command(
+            "/resume session.jsonl",
+            &session,
+            CompactionConfig::default()
+        )
+        .is_none());
         assert!(handle_slash_command("/config", &session, CompactionConfig::default()).is_none());
         assert!(
             handle_slash_command("/config env", &session, CompactionConfig::default()).is_none()
@@ -5152,11 +5142,8 @@ mod tests {
             super::handle_agents_slash_command(Some("help"), &cwd).expect("agents help");
         assert!(agents_help.contains("Usage            /agents [list|help]"));
         assert!(agents_help.contains("Direct CLI       claw agents"));
-        assert!(
-            agents_help.contains(
-                "Sources          .claw/agents, ~/.claw/agents, $CLAW_CONFIG_HOME/agents"
-            )
-        );
+        assert!(agents_help
+            .contains("Sources          .claw/agents, ~/.claw/agents, $CLAW_CONFIG_HOME/agents"));
 
         let agents_unexpected =
             super::handle_agents_slash_command(Some("show planner"), &cwd).expect("agents usage");
@@ -5164,15 +5151,11 @@ mod tests {
 
         let skills_help =
             super::handle_skills_slash_command(Some("--help"), &cwd).expect("skills help");
-        assert!(
-            skills_help
-                .contains("Usage            /skills [list|install <path>|help|<skill> [args]]")
-        );
+        assert!(skills_help
+            .contains("Usage            /skills [list|install <path>|help|<skill> [args]]"));
         assert!(skills_help.contains("Alias            /skill"));
         assert!(skills_help.contains("Invoke           /skills help overview -> $help overview"));
-        assert!(
-            skills_help.contains("Install root     $CLAW_CONFIG_HOME/skills or ~/.claw/skills")
-        );
+        assert!(skills_help.contains("Install root     $CLAW_CONFIG_HOME/skills or ~/.claw/skills"));
         assert!(skills_help.contains(".omc/skills"));
         assert!(skills_help.contains(".agents/skills"));
         assert!(skills_help.contains("~/.claude/skills/omc-learned"));
@@ -5184,19 +5167,15 @@ mod tests {
 
         let skills_install_help = super::handle_skills_slash_command(Some("install --help"), &cwd)
             .expect("nested skills help");
-        assert!(
-            skills_install_help
-                .contains("Usage            /skills [list|install <path>|help|<skill> [args]]")
-        );
+        assert!(skills_install_help
+            .contains("Usage            /skills [list|install <path>|help|<skill> [args]]"));
         assert!(skills_install_help.contains("Alias            /skill"));
         assert!(skills_install_help.contains("Unexpected       install"));
 
         let skills_unknown_help =
             super::handle_skills_slash_command(Some("show --help"), &cwd).expect("skills help");
-        assert!(
-            skills_unknown_help
-                .contains("Usage            /skills [list|install <path>|help|<skill> [args]]")
-        );
+        assert!(skills_unknown_help
+            .contains("Usage            /skills [list|install <path>|help|<skill> [args]]"));
         assert!(skills_unknown_help.contains("Unexpected       show"));
 
         let skills_help_json =
@@ -5208,11 +5187,9 @@ mod tests {
         assert!(sources.iter().any(|value| value == ".omc/skills"));
         assert!(sources.iter().any(|value| value == ".agents/skills"));
         assert!(sources.iter().any(|value| value == "~/.omc/skills"));
-        assert!(
-            sources
-                .iter()
-                .any(|value| value == "~/.claude/skills/omc-learned")
-        );
+        assert!(sources
+            .iter()
+            .any(|value| value == "~/.claude/skills/omc-learned"));
 
         let _ = fs::remove_dir_all(cwd);
     }
@@ -5259,9 +5236,7 @@ mod tests {
         assert!(report.contains("trace · Compatibility skill guidance"));
         assert!(report.contains("cancel · OMC cancel guidance"));
         assert!(report.contains("statusline · Claude config skill guidance"));
-        assert!(
-            report.contains("doctor-check · Claude config command guidance · legacy /commands")
-        );
+        assert!(report.contains("doctor-check · Claude config command guidance · legacy /commands"));
         assert!(report.contains("learned · Learned skill guidance"));
 
         let help =
@@ -5273,11 +5248,9 @@ mod tests {
         assert!(sources.iter().any(|value| value == ".omc/skills"));
         assert!(sources.iter().any(|value| value == ".agents/skills"));
         assert!(sources.iter().any(|value| value == "~/.omc/skills"));
-        assert!(
-            sources
-                .iter()
-                .any(|value| value == "~/.claude/skills/omc-learned")
-        );
+        assert!(sources
+            .iter()
+            .any(|value| value == "~/.claude/skills/omc-learned"));
 
         restore_env_var("HOME", original_home);
         restore_env_var("CLAUDE_CONFIG_DIR", original_claude_config_dir);
@@ -5503,13 +5476,11 @@ mod tests {
         assert_eq!(installed.display_name.as_deref(), Some("help"));
         assert!(installed.installed_path.ends_with(Path::new("help")));
         assert!(installed.installed_path.join("SKILL.md").is_file());
-        assert!(
-            installed
-                .installed_path
-                .join("scripts")
-                .join("run.sh")
-                .is_file()
-        );
+        assert!(installed
+            .installed_path
+            .join("scripts")
+            .join("run.sh")
+            .is_file());
 
         let report = super::render_skill_install_report(&installed);
         assert!(report.contains("Result           installed help"));

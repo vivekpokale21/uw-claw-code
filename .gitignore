@@ -5,3 +5,13 @@ archive/
 # Claude Code local artifacts
 .claude/settings.local.json
 .claude/sessions/
+
+# Local runtime/session artifacts
+.claw/
+.port_sessions/
+rust/.claw/
+
+# Internal local notes/plans (not for remote)
+MIGRATION_PROMPT_AFK_LOCAL_FIRST.md
+docs/claw_local_port/
+docs/superpowers/plans/2026-04-16-semantic-search-pipeline-slices.md

@@ -20,10 +20,26 @@ pub struct MessageRequest {
     pub temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f64>,
+    /// OpenAI-compatible local-runtime extension (llama.cpp and similar).
+    /// Omitted unless explicitly configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+    /// OpenAI-compatible local-runtime extension (llama.cpp and similar).
+    /// Omitted unless explicitly configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frequency_penalty: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub presence_penalty: Option<f64>,
+    /// OpenAI-compatible local-runtime extension (llama.cpp and similar).
+    /// Omitted unless explicitly configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repeat_penalty: Option<f64>,
+    /// OpenAI-compatible local-runtime extension (llama.cpp and similar).
+    /// Omitted unless explicitly configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repeat_last_n: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop: Option<Vec<String>>,
     /// Reasoning effort level for OpenAI-compatible reasoning models (e.g. `o4-mini`).
@@ -31,6 +47,11 @@ pub struct MessageRequest {
     /// Silently ignored by backends that do not support it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Local chat-template controls for OpenAI-compatible runtimes that expose
+    /// template kwargs (for example llama.cpp `chat_template_kwargs`).
+    /// Never required for provider-standard OpenAI payloads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat_template_kwargs: Option<Value>,
 }
 
 impl MessageRequest {

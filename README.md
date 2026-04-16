@@ -1,102 +1,147 @@
-# Claw Code
+# uw-claw-code
 
-<p align="center">
-  <a href="https://github.com/ultraworkers/claw-code">ultraworkers/claw-code</a>
-  ·
-  <a href="./USAGE.md">Usage</a>
-  ·
-  <a href="./rust/README.md">Rust workspace</a>
-  ·
-  <a href="./PARITY.md">Parity</a>
-  ·
-  <a href="./ROADMAP.md">Roadmap</a>
-  ·
-  <a href="https://discord.gg/5TUQKqFWd">UltraWorkers Discord</a>
-</p>
+Local-first Claw fork focused on harness reliability for small/medium open models (Qwen-family on `llama.cpp`).
 
-<p align="center">
-  <a href="https://star-history.com/#ultraworkers/claw-code&Date">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=ultraworkers/claw-code&type=Date&theme=dark" />
-      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=ultraworkers/claw-code&type=Date" />
-      <img alt="Star history for ultraworkers/claw-code" src="https://api.star-history.com/svg?repos=ultraworkers/claw-code&type=Date" width="600" />
-    </picture>
-  </a>
-</p>
+This repo prioritizes:
 
-<p align="center">
-  <img src="assets/claw-hero.jpeg" alt="Claw Code" width="300" />
-</p>
+- deterministic tool execution over one-shot model cleverness
+- robust recovery loops for unattended/AFK operation
+- clear runtime diagnostics when provider/tooling behavior degrades
 
-Claw Code is the public Rust implementation of the `claw` CLI agent harness.
-The canonical implementation lives in [`rust/`](./rust), and the current source of truth for this repository is **ultraworkers/claw-code**.
+## Core Direction
 
-> [!IMPORTANT]
-> Start with [`USAGE.md`](./USAGE.md) for build, auth, CLI, session, and parity-harness workflows. Make `claw doctor` your first health check after building, use [`rust/README.md`](./rust/README.md) for crate-level details, read [`PARITY.md`](./PARITY.md) for the current Rust-port checkpoint, and see [`docs/container.md`](./docs/container.md) for the container-first workflow.
+This fork is centered on hardening the agent harness layer:
 
-## Current repository shape
+- API/provider routing and OpenAI-compatible transport behavior
+- tool-call normalization and dispatch reliability
+- retrieval quality and guardrails (`SemanticSearch`, `grep`, `LSP`, repo context)
+- loop safety (stall detection, compaction, bounded retries)
+- operator controls and inspectability (`doctor`, status/checkpoint controls, health snapshots)
 
-- **`rust/`** — canonical Rust workspace and the `claw` CLI binary
-- **`USAGE.md`** — task-oriented usage guide for the current product surface
-- **`PARITY.md`** — Rust-port parity status and migration notes
-- **`ROADMAP.md`** — active roadmap and cleanup backlog
-- **`PHILOSOPHY.md`** — project intent and system-design framing
-- **`src/` + `tests/`** — companion Python/reference workspace and audit helpers; not the primary runtime surface
+Reference design notes in:
 
-## Quick start
+- `docs/claw_local_port/AGENTS.md`
+- `docs/claw_local_port/PLAN.md`
+- `docs/claw_local_port/STATUS.md`
+- `docs/claw_local_port/FUTURE.md`
 
-> [!NOTE]
-> **`cargo install clawcode` will not work** — this package is not published on crates.io. Build from source as shown below.
+## Major Hardening Work
 
-```bash
-# 1. Clone and build
-git clone https://github.com/ultraworkers/claw-code
-cd claw-code/rust
-cargo build --workspace
+### 1) Provider and Runtime Routing Hardening
 
-# 2. Set your API key (Anthropic API key — not a Claude subscription)
-export ANTHROPIC_API_KEY="sk-ant-..."
+Result:
+- model prefix and provider resolution became explicit and predictable in local multi-provider environments.
 
-# 3. Verify everything is wired correctly
-./target/debug/claw doctor
+### 2) OpenAI-Compatible Stream/Response Resilience (Qwen)
 
-# 4. Run a prompt
-./target/debug/claw prompt "say hello"
-```
+Primary code:
 
-> [!NOTE]
-> **Windows (PowerShell):** the binary is `claw.exe`, not `claw`. Use `.\target\debug\claw.exe` or run `cargo run -- prompt "say hello"` to skip the path lookup.
+- `rust/crates/api/src/providers/openai_compat.rs`
 
-> [!NOTE]
-> **Auth:** claw requires an **API key** (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.) — Claude subscription login is not a supported auth path.
+Result:
+- fewer dead-end turns from malformed/missing tool-call structures in local Qwen-compatible outputs.
 
-Run the workspace test suite:
+### 3) Tool Surface and Dispatch Hardening
+
+Primary code:
+
+- `rust/crates/tools/src/lib.rs`
+- `rust/crates/rusty-claude-cli/src/main.rs`
+
+Hardening themes:
+
+- strict `allowedTools` canonicalization and unsupported-tool rejection
+- stable built-in tool registry for read/edit/search/automation flows
+- alias normalization (`read`, `write`, `edit`, `semantic`, etc.) into canonical tool names
+
+Result:
+- tighter control over what the model can actually call, with deterministic failures instead of silent drift.
+
+### 4) Retrieval Stack Hardening
+
+Primary code:
+
+- `rust/crates/runtime/src/prompt.rs`
+- `rust/crates/runtime/src/conversation.rs`
+- `rust/crates/tools/src/semantic_search.rs`
+- `rust/crates/semantic_search/*`
+
+What was improved:
+
+- repository map injected into prompt context
+- explicit retrieval guidance (`SemanticSearch` first, `grep_search` fallback)
+- retrieval-evidence enforcement before path-targeted edits
+- `SemanticSearch` tool path backed by the new `semantic_search` crate with graceful lexical fallback when embeddings are unavailable
+
+Result:
+- better codebase navigation quality and fewer blind edits.
+
+### 5) LSP Reliability and Health Persistence
+
+Primary code:
+
+- `rust/crates/runtime/src/lsp_client.rs`
+- `rust/crates/runtime/src/prompt.rs` (`# LSP context`)
+
+Result:
+- repeated LSP failures are visible and bounded via cooldown state instead of causing opaque instability.
+
+### 6) AFK/Long-Run Loop Safeguards
+
+Result:
+- long unattended sessions fail faster with useful stop reasons and better context-pressure handling.
+
+### 7) Local Runtime Template/Cache Behavior
+
+Primary path:
+
+- `runtime_templates/qwen35_chat_template_cachefix.jinja`
+
+What was addressed:
+
+- chat template behavior adjusted for better local Qwen cache reuse characteristics and reduced prompt churn.
+
+## Runtime Scripts (Operational)
+
+- `scripts/start_qwen35_llama_server.sh`
+  - launches `llama-server` with approach/mode profiles and template wiring
+- `scripts/qwen35_profiles.sh`
+  - planner/executor/repair sampling profiles
+- `scripts/print_qwen35_profile.sh`
+  - inspect active profile values
+
+## Repository Layout
+
+- `rust/` - Rust runtime, CLI, API providers, tools, command surface
+- `runtime_templates/` - local runtime chat templates
+- `scripts/` - local launcher/profile/operator scripts
+- `docs/claw_local_port/` - AFK local-first design/plan/status docs
+- `USAGE.md` - command and operational usage guide
+- `STATUS.md`, `ROADMAP.md`, `PARITY.md` - ongoing migration and hardening context
+
+## Quick Start
+
+Build:
 
 ```bash
 cd rust
-cargo test --workspace
+cargo build --workspace
 ```
 
-## Documentation map
+Run a local-profile llama server:
 
-- [`USAGE.md`](./USAGE.md) — quick commands, auth, sessions, config, parity harness
-- [`rust/README.md`](./rust/README.md) — crate map, CLI surface, features, workspace layout
-- [`PARITY.md`](./PARITY.md) — parity status for the Rust port
-- [`rust/MOCK_PARITY_HARNESS.md`](./rust/MOCK_PARITY_HARNESS.md) — deterministic mock-service harness details
-- [`ROADMAP.md`](./ROADMAP.md) — active roadmap and open cleanup work
-- [`PHILOSOPHY.md`](./PHILOSOPHY.md) — why the project exists and how it is operated
+```bash
+./scripts/start_qwen35_llama_server.sh --approach omnicoder --mode executor
+```
 
-## Ecosystem
+Run a prompt with local model defaults:
 
-Claw Code is built in the open alongside the broader UltraWorkers toolchain:
+```bash
+./rust/target/debug/claw prompt "inspect this repository and propose a safe refactor plan" --dangerously-skip-permissions
+```
 
-- [clawhip](https://github.com/Yeachan-Heo/clawhip)
-- [oh-my-openagent](https://github.com/code-yeongyu/oh-my-openagent)
-- [oh-my-claudecode](https://github.com/Yeachan-Heo/oh-my-claudecode)
-- [oh-my-codex](https://github.com/Yeachan-Heo/oh-my-codex)
-- [UltraWorkers Discord](https://discord.gg/5TUQKqFWd)
+## Notes
 
-## Ownership / affiliation disclaimer
+This README is intentionally focused on harness/tool hardening and local runtime reliability.
 
-- This repository does **not** claim ownership of the original Claude Code source material.
-- This repository is **not affiliated with, endorsed by, or maintained by Anthropic**.
+For full command docs and configuration surface, use `USAGE.md`.

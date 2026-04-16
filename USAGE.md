@@ -167,6 +167,119 @@ cd rust
 ./target/debug/claw --model "openai/gpt-4.1-mini" prompt "summarize this repository in one sentence"
 ```
 
+## Qwen 3.5 Profile Switching (codex vs chatgpt)
+
+Use the profile scripts when you want fast A/B testing between two decoding bundles (`codex` and `chatgpt`) across `planner`, `executor`, and `repair` modes.
+
+### Show a profile
+
+```bash
+./scripts/print_qwen35_profile.sh codex executor
+./scripts/print_qwen35_profile.sh chatgpt planner
+```
+
+### Start llama.cpp with a profile
+
+```bash
+# default: codex executor
+./scripts/start_qwen35_llama_server.sh
+
+# explicit profile switch
+./scripts/start_qwen35_llama_server.sh --approach chatgpt --mode executor
+./scripts/start_qwen35_llama_server.sh --approach codex --mode repair
+```
+
+Important notes:
+- The launcher keeps your local-first runtime shape (`llama-server`, port `8129`, Qwen 3.5 4B model path defaults).
+- It applies `--chat-template-kwargs '{"enable_thinking": ...}'` per mode.
+- It applies sampler values from the selected profile.
+- `claw` now reads per-request sampler env vars for local Qwen OpenAI-compatible endpoints:
+  - `CLAW_OPENAI_TEMPERATURE`
+  - `CLAW_OPENAI_TOP_P`
+  - `CLAW_OPENAI_TOP_K`
+  - `CLAW_OPENAI_MIN_P`
+  - `CLAW_OPENAI_PRESENCE_PENALTY`
+  - `CLAW_OPENAI_REPEAT_PENALTY`
+  - `CLAW_OPENAI_REPEAT_LAST_N`
+  - `CLAW_OPENAI_ENABLE_THINKING` (maps to `chat_template_kwargs.enable_thinking`)
+- These extension fields are only emitted for local Qwen OpenAI-compatible routes (for example llama.cpp on `localhost`). Remote OpenAI/xAI/DashScope payloads remain spec-clean.
+
+### Run the 8-step ladder (multi-stage pipeline by default)
+
+```bash
+# assumes llama-server is already running on port 8129
+./scripts/run_qwen35_ladder.sh codex
+./scripts/run_qwen35_ladder.sh chatgpt pipeline
+```
+
+The ladder script writes outputs to a timestamped directory under `/tmp/` with:
+- `summary.tsv`
+- `stage_metrics.tsv`
+- `verify_checks.tsv`
+- `task_*.log`
+- `task_*_verify.log`
+- `task_*_checks.log`
+
+Pipeline behavior:
+- default mode is `pipeline` (planner -> executor, with configurable executor retries)
+- optional repair fallback is disabled by default (`QWEN35_MATRIX_ENABLE_REPAIR_FALLBACK=0`)
+- configure retries via `QWEN35_MATRIX_MAX_EXECUTOR_RETRIES` (default: `1`)
+- executor retries are triggered when execution fails or when it exits cleanly without producing meaningful workspace edits (changes under `.claw/` and `.port_sessions/` are ignored)
+- per-task pass/fail is now tracked in `summary.tsv` as `task_pass` (requires stage success + verification success)
+- semantic embeddings are enabled by default in ladder runs with:
+  - `QWEN35_MATRIX_SEMANTIC_EMBED_MODEL=nomic-embed-text-v1.5`
+  - `QWEN35_MATRIX_SEMANTIC_EMBED_BASE_URL=http://127.0.0.1:8130/v1`
+  - disable with `QWEN35_MATRIX_ENABLE_SEMANTIC_EMBEDDINGS=0`
+  - override API key with `QWEN35_MATRIX_SEMANTIC_EMBED_API_KEY`
+
+Task-aware verification:
+- Set `QWEN35_MATRIX_CHECKS_FILE` to a tab-separated checks file:
+  - columns: `task<TAB>label<TAB>command`
+  - `task` is a 1-based task number or `*` for all tasks
+  - blank lines and `#` comments are ignored
+- Toggle meaningful-edit requirement with `QWEN35_MATRIX_REQUIRE_REPO_CHANGES`:
+  - `auto` (default): required for executor/repair/pipeline, not required for single-mode planner
+  - `1`: always require meaningful repo edits
+  - `0`: never require meaningful repo edits
+
+Example with the complex Dubai suite:
+
+```bash
+QWEN35_MATRIX_PROMPTS_FILE=./scripts/qwen35_prompts_dbm_complex.txt \
+QWEN35_MATRIX_CHECKS_FILE=./scripts/qwen35_checks_dbm_complex.tsv \
+QWEN35_MATRIX_SEMANTIC_EMBED_BASE_URL=http://127.0.0.1:8130/v1 \
+./scripts/run_qwen35_ladder.sh codex pipeline
+```
+
+### Semantic Code Search Tool
+
+`SemanticSearch` is now available as a built-in tool for repository retrieval.
+
+- Works out of the box with lexical ranking + on-disk index cache at `.claw/semantic_index_v1.json`
+- Supports optional embedding reranking when a dedicated embedding model is configured
+- Designed to use a separate embedding model from your generation model
+
+Embedding env vars:
+
+- `CLAW_SEMANTIC_EMBED_MODEL` (required to enable embedding mode)
+- `CLAW_SEMANTIC_EMBED_BASE_URL` (optional, defaults to `OPENAI_BASE_URL` or `http://127.0.0.1:8129/v1`)
+- `CLAW_SEMANTIC_EMBED_API_KEY` (optional, defaults to `OPENAI_API_KEY`)
+
+Example (separate local embedding server):
+
+```bash
+export CLAW_SEMANTIC_EMBED_MODEL="nomic-embed-text-v1.5"
+export CLAW_SEMANTIC_EMBED_BASE_URL="http://127.0.0.1:8130/v1"
+```
+
+Legacy single-mode runs are still available for strict profile-isolation benchmarks:
+
+```bash
+./scripts/run_qwen35_ladder.sh codex executor
+./scripts/run_qwen35_ladder.sh codex planner
+./scripts/run_qwen35_ladder.sh codex repair
+```
+
 ### Alibaba DashScope (Qwen)
 
 For Qwen models via Alibaba's native DashScope API (higher rate limits than OpenRouter):

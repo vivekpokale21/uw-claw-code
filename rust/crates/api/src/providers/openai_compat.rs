@@ -228,7 +228,11 @@ impl OpenAiCompatClient {
             .http
             .post(&request_url)
             .header("content-type", "application/json")
-            .json(&build_chat_completion_request(request, self.config()));
+            .json(&build_chat_completion_request_with_base_url(
+                request,
+                self.config(),
+                &self.base_url,
+            ));
         if !self.api_key.trim().is_empty() {
             builder = builder.bearer_auth(&self.api_key);
         }
@@ -586,7 +590,9 @@ impl StreamState {
             }
         } else if self.text_started && !self.text_finished {
             self.text_finished = true;
-            events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent { index: 0 }));
+            events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                index: 0,
+            }));
         }
 
         for state in self.tool_calls.values_mut() {
@@ -828,9 +834,7 @@ fn is_reasoning_model(model: &str) -> bool {
 fn is_qwen_family_model(model: &str) -> bool {
     let lowered = model.to_ascii_lowercase();
     let canonical = lowered.rsplit('/').next().unwrap_or(lowered.as_str());
-    canonical.starts_with("qwen")
-        || canonical.starts_with("qwq")
-        || canonical.contains("qwen3")
+    canonical.starts_with("qwen") || canonical.starts_with("qwq") || canonical.contains("qwen3")
 }
 
 /// Strip routing prefix (e.g., "openai/gpt-4" → "gpt-4") for the wire.
@@ -851,7 +855,16 @@ fn strip_routing_prefix(model: &str) -> &str {
     }
 }
 
+#[cfg(test)]
 fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatConfig) -> Value {
+    build_chat_completion_request_with_base_url(request, config, config.default_base_url)
+}
+
+fn build_chat_completion_request_with_base_url(
+    request: &MessageRequest,
+    config: OpenAiCompatConfig,
+    base_url: &str,
+) -> Value {
     let mut messages = Vec::new();
     if let Some(system) = request.system.as_ref().filter(|value| !value.is_empty()) {
         messages.push(json!({
@@ -921,8 +934,36 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
     if let Some(effort) = &request.reasoning_effort {
         payload["reasoning_effort"] = json!(effort);
     }
+    // Local-only extension payload fields used by llama.cpp-style runtimes.
+    // Never emitted for non-local or non-Qwen routes so provider-standard
+    // OpenAI/xAI/DashScope payloads remain spec-clean.
+    if should_emit_local_qwen_extensions(config, base_url, &request.model) {
+        if let Some(top_k) = request.top_k {
+            payload["top_k"] = json!(top_k);
+        }
+        if let Some(min_p) = request.min_p {
+            payload["min_p"] = json!(min_p);
+        }
+        if let Some(repeat_penalty) = request.repeat_penalty {
+            payload["repeat_penalty"] = json!(repeat_penalty);
+        }
+        if let Some(repeat_last_n) = request.repeat_last_n {
+            payload["repeat_last_n"] = json!(repeat_last_n);
+        }
+        if let Some(kwargs) = &request.chat_template_kwargs {
+            payload["chat_template_kwargs"] = kwargs.clone();
+        }
+    }
 
     payload
+}
+
+fn should_emit_local_qwen_extensions(
+    config: OpenAiCompatConfig,
+    base_url: &str,
+    model: &str,
+) -> bool {
+    config.provider_name == "OpenAI" && is_local_base_url(base_url) && is_qwen_family_model(model)
 }
 
 fn translate_message(message: &InputMessage) -> Vec<Value> {
@@ -1140,6 +1181,15 @@ struct QwenParsedToolCalls {
 }
 
 fn parse_qwen_textual_tool_calls(text: &str) -> QwenParsedToolCalls {
+    let parsed = parse_qwen_xml_tool_calls(text);
+    let parsed = parse_qwen_tool_name_tag_calls(&parsed.remaining_text, parsed.calls);
+    let parsed = parse_qwen_tool_name_and_args_tag_calls(&parsed.remaining_text, parsed.calls);
+    let parsed = parse_qwen_loose_tool_call_tags(&parsed.remaining_text, parsed.calls);
+    let parsed = parse_qwen_markdown_command_calls(&parsed.remaining_text, parsed.calls);
+    parse_qwen_inline_backtick_tool_calls(&parsed.remaining_text, parsed.calls)
+}
+
+fn parse_qwen_xml_tool_calls(text: &str) -> QwenParsedToolCalls {
     const OPEN: &str = "<tool_call>";
     const CLOSE: &str = "</tool_call>";
 
@@ -1170,9 +1220,669 @@ fn parse_qwen_textual_tool_calls(text: &str) -> QwenParsedToolCalls {
     }
 
     QwenParsedToolCalls {
+        remaining_text: remaining,
+        calls,
+    }
+}
+
+fn parse_qwen_loose_tool_call_tags(
+    text: &str,
+    mut calls: Vec<ResponseToolCall>,
+) -> QwenParsedToolCalls {
+    const OPEN: &str = "<tool_call>";
+
+    let mut remaining = String::new();
+    let mut cursor = 0usize;
+
+    while let Some(open_rel) = text[cursor..].find(OPEN) {
+        let open_idx = cursor + open_rel;
+        remaining.push_str(&text[cursor..open_idx]);
+        let block_start = open_idx + OPEN.len();
+        let Some(close_rel) = text[block_start..].find("</") else {
+            remaining.push_str(&text[open_idx..]);
+            cursor = text.len();
+            break;
+        };
+        let close_start = block_start + close_rel;
+        let Some(close_end_rel) = text[close_start..].find('>') else {
+            remaining.push_str(&text[open_idx..]);
+            cursor = text.len();
+            break;
+        };
+        let close_end = close_start + close_end_rel + 1;
+        let block = &text[block_start..close_start];
+        if let Some(call) = parse_qwen_flat_tool_call(block, calls.len()) {
+            calls.push(call);
+        } else {
+            remaining.push_str(&text[open_idx..close_end]);
+        }
+        cursor = close_end;
+    }
+
+    if cursor < text.len() {
+        remaining.push_str(&text[cursor..]);
+    }
+
+    QwenParsedToolCalls {
+        remaining_text: remaining,
+        calls,
+    }
+}
+
+fn parse_qwen_tool_name_tag_calls(
+    text: &str,
+    mut calls: Vec<ResponseToolCall>,
+) -> QwenParsedToolCalls {
+    const TOOL_OPEN: &str = "<tool>";
+    const TOOL_CLOSE: &str = "</tool>";
+    let mut remaining = String::new();
+    let mut cursor = 0usize;
+
+    while let Some(open_rel) = text[cursor..].find(TOOL_OPEN) {
+        let open_idx = cursor + open_rel;
+        remaining.push_str(&text[cursor..open_idx]);
+        let inner_start = open_idx + TOOL_OPEN.len();
+        let Some(close_rel) = text[inner_start..].find(TOOL_CLOSE) else {
+            remaining.push_str(&text[open_idx..]);
+            cursor = text.len();
+            break;
+        };
+        let inner_end = inner_start + close_rel;
+        let close_end = inner_end + TOOL_CLOSE.len();
+        let inner = &text[inner_start..inner_end];
+        if let Some(call) = parse_qwen_named_tool_tag_block(inner, calls.len()) {
+            calls.push(call);
+        } else {
+            remaining.push_str(&text[open_idx..close_end]);
+        }
+        cursor = close_end;
+    }
+
+    if cursor < text.len() {
+        remaining.push_str(&text[cursor..]);
+    }
+
+    QwenParsedToolCalls {
+        remaining_text: remaining,
+        calls,
+    }
+}
+
+fn parse_qwen_tool_name_and_args_tag_calls(
+    text: &str,
+    mut calls: Vec<ResponseToolCall>,
+) -> QwenParsedToolCalls {
+    const OPEN: &str = "<tool_call>";
+
+    let mut remaining = String::new();
+    let mut cursor = 0usize;
+
+    while let Some(open_rel) = text[cursor..].find(OPEN) {
+        let open_idx = cursor + open_rel;
+        remaining.push_str(&text[cursor..open_idx]);
+        let block_start = open_idx + OPEN.len();
+        let close_tool_use = text[block_start..].find("</tool_use>");
+        let close_tool_call = text[block_start..].find("</tool_call>");
+        let close_rel = match (close_tool_use, close_tool_call) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        let Some(close_rel) = close_rel else {
+            remaining.push_str(&text[open_idx..]);
+            cursor = text.len();
+            break;
+        };
+        let close_start = block_start + close_rel;
+        let close_end = text[close_start..]
+            .find('>')
+            .map_or(text.len(), |end_rel| close_start + end_rel + 1);
+        let block = &text[block_start..close_start];
+        if let Some(call) = parse_qwen_tool_name_and_args_tag_block(block, calls.len()) {
+            calls.push(call);
+        } else {
+            remaining.push_str(&text[open_idx..close_end]);
+        }
+        cursor = close_end;
+    }
+
+    if cursor < text.len() {
+        remaining.push_str(&text[cursor..]);
+    }
+
+    QwenParsedToolCalls {
+        remaining_text: remaining,
+        calls,
+    }
+}
+
+fn parse_qwen_markdown_command_calls(
+    text: &str,
+    mut calls: Vec<ResponseToolCall>,
+) -> QwenParsedToolCalls {
+    const OPEN_FENCE: &str = "```";
+
+    let mut remaining = String::new();
+    let mut cursor = 0usize;
+    while let Some(open_rel) = text[cursor..].find(OPEN_FENCE) {
+        let open_idx = cursor + open_rel;
+        remaining.push_str(&text[cursor..open_idx]);
+        let fence_start = open_idx + OPEN_FENCE.len();
+        let Some(close_rel) = text[fence_start..].find(OPEN_FENCE) else {
+            remaining.push_str(&text[open_idx..]);
+            cursor = text.len();
+            break;
+        };
+        let fence_end = fence_start + close_rel;
+        let block = &text[fence_start..fence_end];
+        if let Some(call) = parse_qwen_fenced_bash_call(block, calls.len()) {
+            calls.push(call);
+        } else {
+            remaining.push_str(&text[open_idx..fence_end + OPEN_FENCE.len()]);
+        }
+        cursor = fence_end + OPEN_FENCE.len();
+    }
+    if cursor < text.len() {
+        remaining.push_str(&text[cursor..]);
+    }
+
+    QwenParsedToolCalls {
         remaining_text: remaining.trim().to_string(),
         calls,
     }
+}
+
+fn parse_qwen_inline_backtick_tool_calls(
+    text: &str,
+    mut calls: Vec<ResponseToolCall>,
+) -> QwenParsedToolCalls {
+    let mut remaining = String::new();
+    let mut cursor = 0usize;
+
+    while let Some(open_rel) = text[cursor..].find('`') {
+        let open_idx = cursor + open_rel;
+        remaining.push_str(&text[cursor..open_idx]);
+        let inline_start = open_idx + 1;
+        let Some(close_rel) = text[inline_start..].find('`') else {
+            remaining.push_str(&text[open_idx..]);
+            cursor = text.len();
+            break;
+        };
+        let inline_end = inline_start + close_rel;
+        let block = &text[inline_start..inline_end];
+        if let Some(call) = parse_qwen_inline_tool_invocation(block, calls.len()) {
+            calls.push(call);
+        } else {
+            remaining.push('`');
+            remaining.push_str(block);
+            remaining.push('`');
+        }
+        cursor = inline_end + 1;
+    }
+
+    if cursor < text.len() {
+        remaining.push_str(&text[cursor..]);
+    }
+
+    QwenParsedToolCalls {
+        remaining_text: remaining.trim().to_string(),
+        calls,
+    }
+}
+
+fn parse_qwen_fenced_bash_call(block: &str, index: usize) -> Option<ResponseToolCall> {
+    let trimmed = block.trim();
+    let mut lines = trimmed.lines();
+    let language = lines.next().unwrap_or_default().trim().to_ascii_lowercase();
+    if !matches!(language.as_str(), "bash" | "sh" | "shell" | "zsh") {
+        return None;
+    }
+    let command = lines.collect::<Vec<_>>().join("\n").trim().to_string();
+    if command.is_empty() {
+        return None;
+    }
+    Some(qwen_tool_call(
+        index,
+        "bash",
+        serde_json::Map::from_iter([("command".to_string(), Value::String(command))]),
+    ))
+}
+
+fn parse_qwen_inline_tool_invocation(block: &str, index: usize) -> Option<ResponseToolCall> {
+    let normalized = normalize_quotes(block);
+    let trimmed = normalized.trim();
+    let open_paren = trimmed.find('(')?;
+    let close_paren = trimmed.rfind(')')?;
+    if close_paren <= open_paren || !trimmed[close_paren + 1..].trim().is_empty() {
+        return None;
+    }
+
+    let tool_name = trimmed[..open_paren].trim();
+    let normalized_name = normalize_qwen_tool_name(tool_name);
+    if !is_qwen_tool_name_candidate(&normalized_name) {
+        return None;
+    }
+
+    let raw_args = trimmed[open_paren + 1..close_paren].trim();
+    if raw_args.is_empty() {
+        return None;
+    }
+
+    let input = match serde_json::from_str::<Value>(raw_args).ok() {
+        Some(Value::Object(object)) => object,
+        _ => {
+            let parsed = parse_qwen_kv_pairs(raw_args);
+            if !parsed.is_empty() {
+                parsed
+            } else if let Some(positional) = parse_qwen_positional_args(raw_args, &normalized_name)
+            {
+                positional
+            } else {
+                return None;
+            }
+        }
+    };
+
+    Some(qwen_tool_call(index, &normalized_name, input))
+}
+
+fn parse_qwen_positional_args(
+    raw_args: &str,
+    tool_name: &str,
+) -> Option<serde_json::Map<String, Value>> {
+    let values = serde_json::from_str::<Vec<Value>>(&format!("[{raw_args}]")).ok()?;
+    match tool_name {
+        "edit_file" if values.len() >= 3 => {
+            let mut input = serde_json::Map::new();
+            input.insert("path".to_string(), values.first()?.clone());
+            input.insert("old_string".to_string(), values.get(1)?.clone());
+            input.insert("new_string".to_string(), values.get(2)?.clone());
+            if let Some(replace_all) = values.get(3) {
+                input.insert("replace_all".to_string(), replace_all.clone());
+            }
+            Some(input)
+        }
+        _ => None,
+    }
+}
+
+fn parse_qwen_tool_name_and_args_tag_block(block: &str, index: usize) -> Option<ResponseToolCall> {
+    let tool_name = qwen_tag_values(block, "tool_name")
+        .first()
+        .copied()
+        .or_else(|| {
+            qwen_tag_values_with_close(block, "tool_name", "tool")
+                .first()
+                .copied()
+        })?
+        .trim();
+    if tool_name.is_empty() {
+        return None;
+    }
+    let normalized_name = normalize_qwen_tool_name(tool_name);
+    if !is_qwen_tool_name_candidate(&normalized_name) {
+        return None;
+    }
+
+    let raw_args = qwen_tag_values(block, "tool_args")
+        .first()
+        .map(|value| normalize_quotes(value))
+        .unwrap_or_default();
+    if raw_args.trim().is_empty() {
+        return None;
+    }
+    let input = match serde_json::from_str::<Value>(&raw_args).ok() {
+        Some(Value::Object(object)) => object,
+        _ => {
+            let parsed = parse_qwen_kv_pairs(&raw_args);
+            if parsed.is_empty() {
+                return None;
+            }
+            parsed
+        }
+    };
+
+    Some(qwen_tool_call(index, &normalized_name, input))
+}
+
+fn parse_qwen_flat_tool_call(block: &str, index: usize) -> Option<ResponseToolCall> {
+    let normalized = normalize_quotes(block);
+    let (tool_name, raw_args) = split_tool_name_and_args(&normalized)?;
+    let mut input = parse_qwen_kv_pairs(raw_args);
+    if input.is_empty() {
+        input.insert(
+            "raw".to_string(),
+            Value::String(raw_args.trim().to_string()),
+        );
+    }
+    Some(qwen_tool_call(index, tool_name, input))
+}
+
+fn parse_qwen_named_tool_tag_block(block: &str, index: usize) -> Option<ResponseToolCall> {
+    let names = qwen_tag_values(block, "name");
+    let tool_name = names.first()?.trim();
+    if tool_name.is_empty() {
+        return None;
+    }
+
+    let mut input = serde_json::Map::new();
+    if let Some(arg) = names
+        .get(1)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        let key = match normalize_qwen_tool_name(tool_name).as_str() {
+            "read_file" => "path",
+            "write_file" => "path",
+            "edit_file" => "path",
+            "bash" => "command",
+            "SemanticSearch" => "query",
+            "grep_search" => "pattern",
+            "glob_search" => "pattern",
+            _ => "input",
+        };
+        input.insert(key.to_string(), qwen_parameter_value(arg));
+    }
+
+    for (idx, value) in names.iter().enumerate().skip(2) {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        input.insert(format!("arg{idx}"), qwen_parameter_value(trimmed));
+    }
+
+    Some(qwen_tool_call(index, tool_name, input))
+}
+
+fn qwen_tag_values<'a>(input: &'a str, tag: &str) -> Vec<&'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    qwen_tag_values_with_tokens(input, &open, &close)
+}
+
+fn qwen_tag_values_with_close<'a>(input: &'a str, open_tag: &str, close_tag: &str) -> Vec<&'a str> {
+    let open = format!("<{open_tag}>");
+    let close = format!("</{close_tag}>");
+    qwen_tag_values_with_tokens(input, &open, &close)
+}
+
+fn qwen_tag_values_with_tokens<'a>(input: &'a str, open: &str, close: &str) -> Vec<&'a str> {
+    let mut values = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(open_rel) = input[cursor..].find(&open) {
+        let value_start = cursor + open_rel + open.len();
+        let Some(close_rel) = input[value_start..].find(&close) else {
+            break;
+        };
+        let value_end = value_start + close_rel;
+        values.push(&input[value_start..value_end]);
+        cursor = value_end + close.len();
+    }
+    values
+}
+
+fn split_tool_name_and_args(block: &str) -> Option<(&str, &str)> {
+    let trimmed = block.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(idx) = first_param_assignment_index(trimmed) {
+        let name = trimmed[..idx].trim();
+        let args = trimmed[idx..].trim();
+        if !name.is_empty() && !args.is_empty() {
+            return Some((name, args));
+        }
+    }
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let name = parts.next()?.trim();
+    let args = parts.next()?.trim();
+    if name.is_empty() || args.is_empty() {
+        return None;
+    }
+    Some((name, args))
+}
+
+fn first_param_assignment_index(input: &str) -> Option<usize> {
+    const COMMON_KEYS: &[&str] = &[
+        "query", "path", "pattern", "command", "file", "symbol", "line", "column", "content",
+        "text", "name", "tool",
+    ];
+    let lowered = input.to_ascii_lowercase();
+    COMMON_KEYS
+        .iter()
+        .filter_map(|key| lowered.find(&format!("{key}=")))
+        .min()
+}
+
+fn parse_qwen_kv_pairs(input: &str) -> serde_json::Map<String, Value> {
+    let mut result = serde_json::Map::new();
+    let bytes = input.as_bytes();
+    let len = bytes.len();
+    let mut i = 0usize;
+
+    while i < len {
+        while i < len && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') {
+            i += 1;
+        }
+        if i >= len {
+            break;
+        }
+
+        let key_start = i;
+        while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'-')
+        {
+            i += 1;
+        }
+        if i == key_start {
+            break;
+        }
+        let key = &input[key_start..i];
+
+        while i < len && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= len || bytes[i] != b'=' {
+            break;
+        }
+        i += 1;
+        while i < len && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+
+        let value = if i < len {
+            let quote = bytes[i];
+            if matches!(quote, b'"' | b'\'') {
+                i += 1;
+                let value_start = i;
+                while i < len && bytes[i] != quote {
+                    i += 1;
+                }
+                let raw = &input[value_start..i.min(len)];
+                if i < len {
+                    i += 1;
+                }
+                raw
+            } else {
+                let value_start = i;
+                while i < len && !bytes[i].is_ascii_whitespace() && bytes[i] != b',' {
+                    i += 1;
+                }
+                &input[value_start..i]
+            }
+        } else {
+            ""
+        };
+
+        result.insert(key.to_string(), qwen_parameter_value(value));
+    }
+
+    result
+}
+
+fn qwen_tool_call(
+    index: usize,
+    tool_name: &str,
+    input: serde_json::Map<String, Value>,
+) -> ResponseToolCall {
+    let normalized_name = normalize_qwen_tool_name(tool_name);
+    let normalized_input = normalize_qwen_tool_input(&normalized_name, input);
+    ResponseToolCall {
+        id: format!("qwen_tool_call_{index}"),
+        function: ResponseToolFunction {
+            name: normalized_name,
+            arguments: Value::Object(normalized_input).to_string(),
+        },
+    }
+}
+
+fn is_qwen_tool_name_candidate(name: &str) -> bool {
+    matches!(
+        name,
+        "bash"
+            | "read_file"
+            | "write_file"
+            | "edit_file"
+            | "glob_search"
+            | "grep_search"
+            | "SemanticSearch"
+            | "ToolSearch"
+            | "LSP"
+            | "MCPTool"
+            | "ListMcpResourcesTool"
+            | "ReadMcpResourceTool"
+    ) || name.starts_with("mcp__")
+}
+
+fn normalize_qwen_tool_name(name: &str) -> String {
+    let trimmed = name.trim();
+    let token = trimmed
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-' || *ch == '/')
+        .collect::<String>();
+
+    if let Some(canonical) = canonicalize_qwen_tool_name(&token) {
+        return canonical.to_string();
+    }
+
+    for prefix in [
+        "tool_call",
+        "toolcall",
+        "tool_use",
+        "tooluse",
+        "tool",
+        "python3",
+        "python",
+        "py",
+    ] {
+        if let Some(stripped) = token.strip_prefix(prefix) {
+            let candidate = stripped.trim_start_matches(|ch: char| ch == '_' || ch == '-');
+            if let Some(canonical) = canonicalize_qwen_tool_name(candidate) {
+                return canonical.to_string();
+            }
+            if candidate.starts_with("mcp__") {
+                return candidate.to_string();
+            }
+        }
+    }
+
+    token.to_string()
+}
+
+fn canonicalize_qwen_tool_name(name: &str) -> Option<&'static str> {
+    match name.to_ascii_lowercase().as_str() {
+        "bash" => Some("bash"),
+        "read_file" | "readfile" => Some("read_file"),
+        "write_file" | "writefile" => Some("write_file"),
+        "edit_file" | "editfile" => Some("edit_file"),
+        "glob_search" | "globsearch" => Some("glob_search"),
+        "grep_search" | "grepsearch" => Some("grep_search"),
+        "semanticsearch" | "semantic_search" => Some("SemanticSearch"),
+        "toolsearch" | "tool_search" => Some("ToolSearch"),
+        "lsp" => Some("LSP"),
+        "mcptool" => Some("MCPTool"),
+        "listmcpresourcestool" => Some("ListMcpResourcesTool"),
+        "readmcpresourcetool" => Some("ReadMcpResourceTool"),
+        _ => None,
+    }
+}
+
+fn normalize_qwen_tool_input(
+    tool_name: &str,
+    mut input: serde_json::Map<String, Value>,
+) -> serde_json::Map<String, Value> {
+    match tool_name {
+        "read_file" | "write_file" | "edit_file" => {
+            if !input.contains_key("path") {
+                for alias in ["file", "file_path", "filepath"] {
+                    if let Some(value) = input.remove(alias) {
+                        input.insert("path".to_string(), value);
+                        break;
+                    }
+                }
+            }
+            if tool_name == "edit_file" {
+                if !input.contains_key("old_string") {
+                    for alias in ["search", "old", "find"] {
+                        if let Some(value) = input.remove(alias) {
+                            input.insert("old_string".to_string(), value);
+                            break;
+                        }
+                    }
+                }
+                if !input.contains_key("new_string") {
+                    for alias in ["replace", "new", "replacement"] {
+                        if let Some(value) = input.remove(alias) {
+                            input.insert("new_string".to_string(), value);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        "grep_search" => {
+            if !input.contains_key("pattern") {
+                for alias in ["query", "text", "input"] {
+                    if let Some(value) = input.remove(alias) {
+                        input.insert("pattern".to_string(), value);
+                        break;
+                    }
+                }
+            }
+            if !input.contains_key("path") {
+                if let Some(value) = input.remove("file") {
+                    input.insert("path".to_string(), value);
+                }
+            }
+        }
+        "SemanticSearch" => {
+            if !input.contains_key("query") {
+                for alias in ["pattern", "text", "input"] {
+                    if let Some(value) = input.remove(alias) {
+                        input.insert("query".to_string(), value);
+                        break;
+                    }
+                }
+            }
+        }
+        "bash" => {
+            if !input.contains_key("command") {
+                for alias in ["cmd", "input", "text"] {
+                    if let Some(value) = input.remove(alias) {
+                        input.insert("command".to_string(), value);
+                        break;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    input
+}
+
+fn normalize_quotes(input: &str) -> String {
+    input.replace(['“', '”'], "\"").replace(['‘', '’'], "'")
 }
 
 fn parse_qwen_textual_tool_call_block(block: &str, index: usize) -> Option<ResponseToolCall> {
@@ -1429,12 +2139,23 @@ impl StringExt for String {
     }
 }
 
-fn first_non_empty_text(candidates: impl IntoIterator<Item = Option<String>>) -> Option<String> {
+fn first_non_empty_text_trimmed(
+    candidates: impl IntoIterator<Item = Option<String>>,
+) -> Option<String> {
     candidates
         .into_iter()
         .flatten()
         .map(|value| value.trim().to_string())
         .find(|value| !value.is_empty())
+}
+
+fn first_non_empty_text_preserving_whitespace(
+    candidates: impl IntoIterator<Item = Option<String>>,
+) -> Option<String> {
+    candidates
+        .into_iter()
+        .flatten()
+        .find(|value| !value.trim().is_empty())
 }
 
 fn reasoning_value_to_text(value: Option<&Value>) -> Option<String> {
@@ -1467,7 +2188,7 @@ fn reasoning_value_to_text(value: Option<&Value>) -> Option<String> {
 }
 
 fn message_text_content(message: &ChatMessage) -> Option<String> {
-    first_non_empty_text([
+    first_non_empty_text_trimmed([
         message.content.clone(),
         message.reasoning_content.clone(),
         reasoning_value_to_text(message.reasoning.as_ref()),
@@ -1475,7 +2196,7 @@ fn message_text_content(message: &ChatMessage) -> Option<String> {
 }
 
 fn delta_text_content(delta: &ChunkDelta) -> Option<String> {
-    first_non_empty_text([
+    first_non_empty_text_preserving_whitespace([
         delta.content.clone(),
         delta.reasoning_content.clone(),
         reasoning_value_to_text(delta.reasoning.as_ref()),
@@ -1681,6 +2402,150 @@ mod tests {
     }
 
     #[test]
+    fn parses_qwen_loose_tool_call_markup() {
+        let payload =
+            "<tool_call>SemanticSearch query=\"API_MAX_POINTS\"</SemanticSearch>\ncontinue";
+        let parsed = super::parse_qwen_textual_tool_calls(payload);
+        assert_eq!(
+            parsed.calls.len(),
+            1,
+            "one loose tool call should be inferred"
+        );
+        assert_eq!(parsed.remaining_text, "continue");
+        assert_eq!(parsed.calls[0].function.name, "SemanticSearch");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&parsed.calls[0].function.arguments)
+                .expect("arguments should be valid json"),
+            json!({"query":"API_MAX_POINTS"})
+        );
+    }
+
+    #[test]
+    fn normalizes_qwen_grep_search_file_and_query_aliases() {
+        let payload =
+            "<tool_call>grep_search file=\"app/config.py\" query=\"API_MAX_POINTS\"</grep_search>";
+        let parsed = super::parse_qwen_textual_tool_calls(payload);
+        assert_eq!(parsed.calls.len(), 1);
+        assert_eq!(parsed.calls[0].function.name, "grep_search");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&parsed.calls[0].function.arguments)
+                .expect("arguments should be valid json"),
+            json!({"path":"app/config.py","pattern":"API_MAX_POINTS"})
+        );
+    }
+
+    #[test]
+    fn normalizes_qwen_tool_prefixed_name() {
+        let payload =
+            "<tool_call>toolSemanticSearch query=\"app/api.py\"</SemanticSearch>\ncontinue";
+        let parsed = super::parse_qwen_textual_tool_calls(payload);
+        assert_eq!(parsed.calls.len(), 1);
+        assert_eq!(parsed.calls[0].function.name, "SemanticSearch");
+    }
+
+    #[test]
+    fn normalizes_qwen_toolcall_prefixed_name() {
+        let payload = "<tool_call>toolcallgrep_search query=\"API_MAX_POINTS\"</grep_search>";
+        let parsed = super::parse_qwen_textual_tool_calls(payload);
+        assert_eq!(parsed.calls.len(), 1);
+        assert_eq!(parsed.calls[0].function.name, "grep_search");
+    }
+
+    #[test]
+    fn parses_qwen_named_tool_tags() {
+        let payload =
+            "<tool_call><tool><name>read_file</name><name>app/config.py</name></tool></tool_call>";
+        let parsed = super::parse_qwen_textual_tool_calls(payload);
+        assert_eq!(parsed.calls.len(), 1);
+        assert_eq!(parsed.calls[0].function.name, "read_file");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&parsed.calls[0].function.arguments)
+                .expect("arguments should be valid json"),
+            json!({"path":"app/config.py"})
+        );
+    }
+
+    #[test]
+    fn parses_qwen_tool_name_and_tool_args_tags() {
+        let payload = "<tool_call>tool_use><tool_name>read_file</tool><tool_args>{“path”:“app/config.py”}</tool_args></tool_use>";
+        let parsed = super::parse_qwen_textual_tool_calls(payload);
+        assert_eq!(parsed.calls.len(), 1);
+        assert_eq!(parsed.calls[0].function.name, "read_file");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&parsed.calls[0].function.arguments)
+                .expect("arguments should be valid json"),
+            json!({"path":"app/config.py"})
+        );
+    }
+
+    #[test]
+    fn parses_qwen_inline_backtick_tool_invocation() {
+        let payload = "I will edit now: `edit_file(file_path=\"/tmp/probe_edit.txt\",search=\"alpha\",replace=\"beta\")`";
+        let parsed = super::parse_qwen_textual_tool_calls(payload);
+        assert_eq!(parsed.calls.len(), 1);
+        assert_eq!(parsed.calls[0].function.name, "edit_file");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&parsed.calls[0].function.arguments)
+                .expect("arguments should be valid json"),
+            json!({
+                "path":"/tmp/probe_edit.txt",
+                "old_string":"alpha",
+                "new_string":"beta"
+            })
+        );
+    }
+
+    #[test]
+    fn parses_qwen_inline_python_prefixed_positional_edit_call() {
+        let payload = "Do it: `pythonedit_file(\"probe_edit.txt\",\"alpha\",\"beta\")`";
+        let parsed = super::parse_qwen_textual_tool_calls(payload);
+        assert_eq!(parsed.calls.len(), 1);
+        assert_eq!(parsed.calls[0].function.name, "edit_file");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&parsed.calls[0].function.arguments)
+                .expect("arguments should be valid json"),
+            json!({
+                "path":"probe_edit.txt",
+                "old_string":"alpha",
+                "new_string":"beta"
+            })
+        );
+    }
+
+    #[test]
+    fn does_not_promote_unknown_backtick_function_invocation() {
+        let payload = "Planning: `not_a_tool(path=\"app/config.py\")`";
+        let parsed = super::parse_qwen_textual_tool_calls(payload);
+        assert_eq!(parsed.calls.len(), 0, "unknown call should remain text");
+        assert_eq!(parsed.remaining_text, payload);
+    }
+
+    #[test]
+    fn normalizes_qwen_read_file_name_and_file_key_alias() {
+        let payload = "<tool_call>read_file( file=app/config.py</tool_call>";
+        let parsed = super::parse_qwen_textual_tool_calls(payload);
+        assert_eq!(parsed.calls.len(), 1);
+        assert_eq!(parsed.calls[0].function.name, "read_file");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&parsed.calls[0].function.arguments)
+                .expect("arguments should be valid json"),
+            json!({"path":"app/config.py"})
+        );
+    }
+
+    #[test]
+    fn does_not_promote_inline_bash_backticks_without_explicit_tool_tag() {
+        let payload = "Let me inspect with `bash rg -n \"API_MAX_POINTS\" app/config.py` first.";
+        let parsed = super::parse_qwen_textual_tool_calls(payload);
+        assert_eq!(
+            parsed.calls.len(),
+            0,
+            "inline command text should remain text"
+        );
+        assert_eq!(parsed.remaining_text, payload);
+    }
+
+    #[test]
     fn normalize_response_promotes_qwen_textual_tool_calls_when_native_calls_missing() {
         let response: super::ChatCompletionResponse = serde_json::from_value(json!({
             "id": "chatcmpl-qwen-text",
@@ -1840,16 +2705,13 @@ mod tests {
             model: "gpt-4o".to_string(),
             max_tokens: 1024,
             messages: vec![],
-            system: None,
-            tools: None,
-            tool_choice: None,
             stream: false,
             temperature: Some(0.7),
             top_p: Some(0.9),
             frequency_penalty: Some(0.5),
             presence_penalty: Some(0.3),
             stop: Some(vec!["\n".to_string()]),
-            reasoning_effort: None,
+            ..Default::default()
         };
         let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
         assert_eq!(payload["temperature"], 0.7);
@@ -1857,6 +2719,64 @@ mod tests {
         assert_eq!(payload["frequency_penalty"], 0.5);
         assert_eq!(payload["presence_penalty"], 0.3);
         assert_eq!(payload["stop"], json!(["\n"]));
+    }
+
+    #[test]
+    fn local_qwen_payload_includes_runtime_extension_fields() {
+        let request = MessageRequest {
+            model: "qwen3.5:4b".to_string(),
+            max_tokens: 1024,
+            messages: vec![],
+            stream: false,
+            top_k: Some(20),
+            min_p: Some(0.0),
+            repeat_penalty: Some(1.01),
+            repeat_last_n: Some(128),
+            chat_template_kwargs: Some(json!({ "enable_thinking": false })),
+            ..Default::default()
+        };
+        let payload = super::build_chat_completion_request_with_base_url(
+            &request,
+            OpenAiCompatConfig::openai(),
+            "http://127.0.0.1:8129/v1",
+        );
+        assert_eq!(payload["top_k"], 20);
+        assert_eq!(payload["min_p"], 0.0);
+        assert_eq!(payload["repeat_penalty"], 1.01);
+        assert_eq!(payload["repeat_last_n"], 128);
+        assert_eq!(
+            payload["chat_template_kwargs"],
+            json!({ "enable_thinking": false })
+        );
+    }
+
+    #[test]
+    fn remote_openai_payload_strips_runtime_extension_fields() {
+        let request = MessageRequest {
+            model: "qwen3.5:4b".to_string(),
+            max_tokens: 1024,
+            messages: vec![],
+            stream: false,
+            top_k: Some(20),
+            min_p: Some(0.0),
+            repeat_penalty: Some(1.01),
+            repeat_last_n: Some(128),
+            chat_template_kwargs: Some(json!({ "enable_thinking": false })),
+            ..Default::default()
+        };
+        let payload = super::build_chat_completion_request_with_base_url(
+            &request,
+            OpenAiCompatConfig::openai(),
+            "https://api.openai.com/v1",
+        );
+        assert!(
+            payload.get("top_k").is_none(),
+            "top_k should not be emitted to remote OpenAI endpoints"
+        );
+        assert!(payload.get("min_p").is_none());
+        assert!(payload.get("repeat_penalty").is_none());
+        assert!(payload.get("repeat_last_n").is_none());
+        assert!(payload.get("chat_template_kwargs").is_none());
     }
 
     #[test]
@@ -1998,7 +2918,11 @@ mod tests {
 
         let normalized =
             super::normalize_response("qwen3.5:4b", response).expect("response should normalize");
-        assert_eq!(normalized.content.len(), 1, "fallback text should be emitted");
+        assert_eq!(
+            normalized.content.len(),
+            1,
+            "fallback text should be emitted"
+        );
         match &normalized.content[0] {
             OutputContentBlock::Text { text } => assert_eq!(text, "FINAL ANSWER: ready"),
             other => panic!("expected text content block, got {other:?}"),
@@ -2108,6 +3032,68 @@ mod tests {
                 }) if name == "read_file"
             )
         });
-        assert!(saw_tool_start, "legacy function_call should map to tool_use");
+        assert!(
+            saw_tool_start,
+            "legacy function_call should map to tool_use"
+        );
+    }
+
+    #[test]
+    fn stream_state_preserves_leading_whitespace_in_text_deltas() {
+        let chunk_one: super::ChatCompletionChunk = serde_json::from_value(json!({
+            "id": "chatcmpl-stream-text-1",
+            "model": "gpt-4o-mini",
+            "choices": [{
+                "delta": {
+                    "content": "Now"
+                }
+            }]
+        }))
+        .expect("chunk json should deserialize");
+
+        let chunk_two: super::ChatCompletionChunk = serde_json::from_value(json!({
+            "id": "chatcmpl-stream-text-2",
+            "model": "gpt-4o-mini",
+            "choices": [{
+                "delta": {
+                    "content": " Iunderstand"
+                }
+            }]
+        }))
+        .expect("chunk json should deserialize");
+
+        let mut state = super::StreamState::new("gpt-4o-mini".to_string());
+        let first_events = state
+            .ingest_chunk(chunk_one)
+            .expect("first chunk should be ingested");
+        let saw_first_delta = first_events.iter().any(|event| {
+            matches!(
+                event,
+                StreamEvent::ContentBlockDelta(delta_event)
+                    if matches!(
+                        delta_event.delta,
+                        ContentBlockDelta::TextDelta { ref text } if text == "Now"
+                    )
+            )
+        });
+        assert!(saw_first_delta, "first delta should be emitted as-is");
+
+        let second_events = state
+            .ingest_chunk(chunk_two)
+            .expect("second chunk should be ingested");
+        let saw_second_delta_with_space = second_events.iter().any(|event| {
+            matches!(
+                event,
+                StreamEvent::ContentBlockDelta(delta_event)
+                    if matches!(
+                        delta_event.delta,
+                        ContentBlockDelta::TextDelta { ref text } if text == " Iunderstand"
+                    )
+            )
+        });
+        assert!(
+            saw_second_delta_with_space,
+            "second delta should preserve leading space"
+        );
     }
 }

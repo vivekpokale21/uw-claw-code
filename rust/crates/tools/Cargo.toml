@@ -11,6 +11,7 @@ commands = { path = "../commands" }
 flate2 = "1"
 plugins = { path = "../plugins" }
 runtime = { path = "../runtime" }
+semantic_search_lib = { package = "semantic_search", path = "../semantic_search" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true

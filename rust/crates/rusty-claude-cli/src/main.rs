@@ -24,39 +24,39 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
-    AnthropicClient, AuthSource, ContentBlockDelta, InputContentBlock, InputMessage,
-    MessageRequest, MessageResponse, OutputContentBlock, PromptCache,
-    ProviderClient as ApiProviderClient, ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice,
-    ToolDefinition, ToolResultContentBlock, detect_provider_kind, oauth_token_is_expired,
-    resolve_startup_auth_source,
+    detect_provider_kind, oauth_token_is_expired, resolve_startup_auth_source, AnthropicClient,
+    AuthSource, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
+    MessageResponse, OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient,
+    ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
+    ToolResultContentBlock,
 };
 
 use commands::{
-    SkillSlashDispatch, SlashCommand, classify_skills_slash_command, handle_agents_slash_command,
-    handle_agents_slash_command_json, handle_mcp_slash_command, handle_mcp_slash_command_json,
-    handle_plugins_slash_command, handle_skills_slash_command, handle_skills_slash_command_json,
-    render_slash_command_help, render_slash_command_help_filtered, resolve_skill_invocation,
-    resume_supported_slash_commands, slash_command_specs, validate_slash_command_input,
+    classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
+    handle_mcp_slash_command, handle_mcp_slash_command_json, handle_plugins_slash_command,
+    handle_skills_slash_command, handle_skills_slash_command_json, render_slash_command_help,
+    render_slash_command_help_filtered, resolve_skill_invocation, resume_supported_slash_commands,
+    slash_command_specs, validate_slash_command_input, SkillSlashDispatch, SlashCommand,
 };
-use compat_harness::{UpstreamPaths, extract_manifest};
+use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
-    ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource,
-    ContentBlock, ConversationMessage, ConversationRuntime, McpServer, McpServerManager,
-    McpServerSpec, McpTool, MessageRole, ModelPricing, OAuthAuthorizationRequest, OAuthConfig,
-    OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent,
-    ResolvedPermissionMode, RuntimeError, Session, TokenUsage, ToolError, ToolExecutor,
-    UsageTracker, check_base_commit, clear_oauth_credentials, format_stale_base_warning,
-    format_usd, generate_pkce_pair, generate_state, load_oauth_credentials, load_system_prompt,
+    check_base_commit, clear_oauth_credentials, format_stale_base_warning, format_usd,
+    generate_pkce_pair, generate_state, load_oauth_credentials, load_system_prompt,
     parse_oauth_callback_request_target, pricing_for_model, resolve_expected_base,
-    resolve_sandbox_status, save_oauth_credentials,
+    resolve_sandbox_status, save_oauth_credentials, ApiClient, ApiRequest, AssistantEvent,
+    CompactionConfig, ConfigLoader, ConfigSource, ContentBlock, ConversationMessage,
+    ConversationRuntime, McpServer, McpServerManager, McpServerSpec, McpTool, MessageRole,
+    ModelPricing, OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest,
+    PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode,
+    RuntimeError, Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use tools::{
-    GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput, execute_tool, mvp_tool_specs,
+    execute_tool, mvp_tool_specs, GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput,
 };
 
 const DEFAULT_MODEL: &str = "qwen3.5:4b";
@@ -85,6 +85,15 @@ const PRIMARY_SESSION_EXTENSION: &str = "jsonl";
 const LEGACY_SESSION_EXTENSION: &str = "json";
 const LATEST_SESSION_REFERENCE: &str = "latest";
 const SESSION_REFERENCE_ALIASES: &[&str] = &[LATEST_SESSION_REFERENCE, "last", "recent"];
+const OPENAI_TEMPERATURE_ENV: &str = "CLAW_OPENAI_TEMPERATURE";
+const OPENAI_TOP_P_ENV: &str = "CLAW_OPENAI_TOP_P";
+const OPENAI_TOP_K_ENV: &str = "CLAW_OPENAI_TOP_K";
+const OPENAI_MIN_P_ENV: &str = "CLAW_OPENAI_MIN_P";
+const OPENAI_PRESENCE_PENALTY_ENV: &str = "CLAW_OPENAI_PRESENCE_PENALTY";
+const OPENAI_REPEAT_PENALTY_ENV: &str = "CLAW_OPENAI_REPEAT_PENALTY";
+const OPENAI_REPEAT_LAST_N_ENV: &str = "CLAW_OPENAI_REPEAT_LAST_N";
+const OPENAI_ENABLE_THINKING_ENV: &str = "CLAW_OPENAI_ENABLE_THINKING";
+const OPENAI_FORCE_FIRST_TOOL_CALL_ENV: &str = "CLAW_OPENAI_FORCE_FIRST_TOOL_CALL";
 const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--help",
     "-h",
@@ -102,6 +111,51 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--base-commit",
     "-p",
 ];
+
+fn parse_env_f64(name: &str) -> Option<f64> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<f64>().ok())
+}
+
+fn parse_env_u32(name: &str) -> Option<u32> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<u32>().ok())
+}
+
+fn parse_env_bool(name: &str) -> Option<bool> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .and_then(|value| match value.as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        })
+}
+
+fn is_local_openai_endpoint(base_url: &str) -> bool {
+    let lower = base_url.to_ascii_lowercase();
+    lower.starts_with("http://127.0.0.1")
+        || lower.starts_with("https://127.0.0.1")
+        || lower.starts_with("http://localhost")
+        || lower.starts_with("https://localhost")
+        || lower.starts_with("http://0.0.0.0")
+        || lower.starts_with("https://0.0.0.0")
+        || lower.starts_with("http://[::1]")
+        || lower.starts_with("https://[::1]")
+}
+
+fn is_qwen_family_model_name(model: &str) -> bool {
+    let lowered = model.to_ascii_lowercase();
+    let canonical = lowered.rsplit('/').next().unwrap_or(lowered.as_str());
+    canonical.starts_with("qwen") || canonical.starts_with("qwq") || canonical.contains("qwen3")
+}
 
 type AllowedToolSet = BTreeSet<String>;
 type RuntimePluginStateBuildOutput = (
@@ -1753,12 +1807,10 @@ fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck {
         ("cwd".to_string(), json!(context.cwd.display().to_string())),
         (
             "project_root".to_string(),
-            json!(
-                context
-                    .project_root
-                    .as_ref()
-                    .map(|path| path.display().to_string())
-            ),
+            json!(context
+                .project_root
+                .as_ref()
+                .map(|path| path.display().to_string())),
         ),
         ("in_git_repo".to_string(), json!(in_repo)),
         ("git_branch".to_string(), json!(context.git_branch)),
@@ -6545,12 +6597,10 @@ impl InternalPromptProgressRun {
 
         let (heartbeat_stop, heartbeat_rx) = mpsc::channel();
         let heartbeat_reporter = reporter.clone();
-        let heartbeat_handle = thread::spawn(move || {
-            loop {
-                match heartbeat_rx.recv_timeout(INTERNAL_PROGRESS_HEARTBEAT_INTERVAL) {
-                    Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
-                    Err(RecvTimeoutError::Timeout) => heartbeat_reporter.emit_heartbeat(),
-                }
+        let heartbeat_handle = thread::spawn(move || loop {
+            match heartbeat_rx.recv_timeout(INTERNAL_PROGRESS_HEARTBEAT_INTERVAL) {
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Timeout) => heartbeat_reporter.emit_heartbeat(),
             }
         });
 
@@ -6946,6 +6996,52 @@ impl AnthropicRuntimeClient {
     fn set_reasoning_effort(&mut self, effort: Option<String>) {
         self.reasoning_effort = effort;
     }
+
+    fn apply_local_qwen_openai_overrides(&self, request: &mut MessageRequest, is_post_tool: bool) {
+        let ApiProviderClient::OpenAi(client) = &self.client else {
+            return;
+        };
+        if !is_local_openai_endpoint(client.base_url()) || !is_qwen_family_model_name(&self.model) {
+            return;
+        }
+
+        request.temperature = request
+            .temperature
+            .or(parse_env_f64(OPENAI_TEMPERATURE_ENV));
+        request.top_p = request.top_p.or(parse_env_f64(OPENAI_TOP_P_ENV));
+        request.top_k = request.top_k.or(parse_env_u32(OPENAI_TOP_K_ENV));
+        request.min_p = request.min_p.or(parse_env_f64(OPENAI_MIN_P_ENV));
+        request.presence_penalty = request
+            .presence_penalty
+            .or(parse_env_f64(OPENAI_PRESENCE_PENALTY_ENV));
+        request.repeat_penalty = request
+            .repeat_penalty
+            .or(parse_env_f64(OPENAI_REPEAT_PENALTY_ENV));
+        request.repeat_last_n = request
+            .repeat_last_n
+            .or(parse_env_u32(OPENAI_REPEAT_LAST_N_ENV));
+
+        if let Some(enable_thinking) = parse_env_bool(OPENAI_ENABLE_THINKING_ENV) {
+            let mut kwargs = request
+                .chat_template_kwargs
+                .as_ref()
+                .and_then(serde_json::Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            kwargs.insert("enable_thinking".to_string(), json!(enable_thinking));
+            request.chat_template_kwargs = Some(Value::Object(kwargs));
+        }
+
+        if parse_env_bool(OPENAI_FORCE_FIRST_TOOL_CALL_ENV).unwrap_or(false)
+            && !is_post_tool
+            && request
+                .tools
+                .as_ref()
+                .is_some_and(|tools| !tools.is_empty())
+        {
+            request.tool_choice = Some(ToolChoice::Any);
+        }
+    }
 }
 
 fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
@@ -6981,7 +7077,7 @@ impl ApiClient for AnthropicRuntimeClient {
             progress_reporter.mark_model_phase();
         }
         let is_post_tool = request_ends_with_tool_result(&request);
-        let message_request = MessageRequest {
+        let mut message_request = MessageRequest {
             model: self.model.clone(),
             max_tokens: max_tokens_for_model(&self.model),
             messages: convert_messages(&request.messages),
@@ -6994,6 +7090,7 @@ impl ApiClient for AnthropicRuntimeClient {
             reasoning_effort: self.reasoning_effort.clone(),
             ..Default::default()
         };
+        self.apply_local_qwen_openai_overrides(&mut message_request, is_post_tool);
 
         self.runtime.block_on(async {
             // When resuming after tool execution, apply a stall timeout on the
@@ -8130,30 +8227,37 @@ impl CliToolExecutor {
 
 impl ToolExecutor for CliToolExecutor {
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+        let mut resolved_tool_name = tool_name.to_string();
+        let mut value = serde_json::from_str(input)
+            .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+        if let Some((normalized_name, normalized_input)) =
+            unwrap_tool_use_wrapper(tool_name, &value)
+        {
+            resolved_tool_name = normalized_name;
+            value = normalized_input;
+        }
         if self
             .allowed_tools
             .as_ref()
-            .is_some_and(|allowed| !allowed.contains(tool_name))
+            .is_some_and(|allowed| !allowed.contains(&resolved_tool_name))
         {
             return Err(ToolError::new(format!(
-                "tool `{tool_name}` is not enabled by the current --allowedTools setting"
+                "tool `{resolved_tool_name}` is not enabled by the current --allowedTools setting"
             )));
         }
-        let value = serde_json::from_str(input)
-            .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        let result = if tool_name == "ToolSearch" {
+        let result = if resolved_tool_name == "ToolSearch" {
             self.execute_search_tool(value)
-        } else if self.tool_registry.has_runtime_tool(tool_name) {
-            self.execute_runtime_tool(tool_name, value)
+        } else if self.tool_registry.has_runtime_tool(&resolved_tool_name) {
+            self.execute_runtime_tool(&resolved_tool_name, value)
         } else {
             self.tool_registry
-                .execute(tool_name, &value)
+                .execute(&resolved_tool_name, &value)
                 .map_err(ToolError::new)
         };
         match result {
             Ok(output) => {
                 if self.emit_output {
-                    let markdown = format_tool_result(tool_name, &output, false);
+                    let markdown = format_tool_result(&resolved_tool_name, &output, false);
                     self.renderer
                         .stream_markdown(&markdown, &mut io::stdout())
                         .map_err(|error| ToolError::new(error.to_string()))?;
@@ -8162,7 +8266,8 @@ impl ToolExecutor for CliToolExecutor {
             }
             Err(error) => {
                 if self.emit_output {
-                    let markdown = format_tool_result(tool_name, &error.to_string(), true);
+                    let markdown =
+                        format_tool_result(&resolved_tool_name, &error.to_string(), true);
                     self.renderer
                         .stream_markdown(&markdown, &mut io::stdout())
                         .map_err(|stream_error| ToolError::new(stream_error.to_string()))?;
@@ -8170,6 +8275,76 @@ impl ToolExecutor for CliToolExecutor {
                 Err(error)
             }
         }
+    }
+}
+
+fn unwrap_tool_use_wrapper(
+    tool_name: &str,
+    value: &serde_json::Value,
+) -> Option<(String, serde_json::Value)> {
+    if !matches!(tool_name, "tool_use" | "tool") {
+        return None;
+    }
+    let object = value.as_object()?;
+    if let Some(name) = object.get("name").and_then(serde_json::Value::as_str) {
+        if let Some(arguments) = object.get("arguments").or_else(|| object.get("args")) {
+            let normalized_name = normalize_wrapped_tool_name(name)?;
+            let normalized_args = normalize_wrapped_tool_arguments(arguments)?;
+            return Some((normalized_name, normalized_args));
+        }
+        if let Some((normalized_name, normalized_args)) = parse_compact_tool_use_name(name) {
+            return Some((normalized_name, normalized_args));
+        }
+    }
+    if let Some(name) = object.get("tool").and_then(serde_json::Value::as_str) {
+        let arguments = object
+            .get("arguments")
+            .or_else(|| object.get("args"))
+            .or_else(|| object.get("input"))?;
+        let normalized_name = normalize_wrapped_tool_name(name)?;
+        let normalized_args = normalize_wrapped_tool_arguments(arguments)?;
+        return Some((normalized_name, normalized_args));
+    }
+    None
+}
+
+fn parse_compact_tool_use_name(name: &str) -> Option<(String, serde_json::Value)> {
+    for marker in ["arguments=", "args="] {
+        let Some(split_at) = name.find(marker) else {
+            continue;
+        };
+        let raw_name = name[..split_at].trim();
+        let raw_args = name[split_at + marker.len()..].trim();
+        let normalized_name = normalize_wrapped_tool_name(raw_name)?;
+        let normalized_args =
+            normalize_wrapped_tool_arguments(&serde_json::Value::String(raw_args.to_string()))?;
+        return Some((normalized_name, normalized_args));
+    }
+    None
+}
+
+fn normalize_wrapped_tool_arguments(value: &serde_json::Value) -> Option<serde_json::Value> {
+    match value {
+        serde_json::Value::Object(_) => Some(value.clone()),
+        serde_json::Value::String(raw) => serde_json::from_str::<serde_json::Value>(raw)
+            .ok()
+            .filter(|parsed| parsed.is_object()),
+        _ => None,
+    }
+}
+
+fn normalize_wrapped_tool_name(name: &str) -> Option<String> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "read_file" | "readfile" | "read" | "cat" => Some("read_file".to_string()),
+        "write_file" | "writefile" | "write" => Some("write_file".to_string()),
+        "edit_file" | "editfile" | "edit" => Some("edit_file".to_string()),
+        "glob_search" | "globsearch" | "glob" => Some("glob_search".to_string()),
+        "grep_search" | "grepsearch" | "grep" => Some("grep_search".to_string()),
+        "semanticsearch" | "semantic_search" | "semantic" => Some("SemanticSearch".to_string()),
+        "toolsearch" | "tool_search" => Some("ToolSearch".to_string()),
+        "lsp" => Some("LSP".to_string()),
+        "bash" => Some("bash".to_string()),
+        _ => None,
     }
 }
 
@@ -8392,39 +8567,39 @@ fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
 #[cfg(test)]
 mod tests {
     use super::{
-        CliAction, CliOutputFormat, CliToolExecutor, DEFAULT_MODEL, GitWorkspaceSummary,
-        InternalPromptProgressEvent, InternalPromptProgressState, LATEST_SESSION_REFERENCE,
-        LiveCli, LocalHelpTopic, PromptHistoryEntry, STUB_COMMANDS, SlashCommand, StatusUsage,
         build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
-        collect_session_prompt_history, create_managed_session_handle, describe_tool_progress,
-        filter_tool_specs, format_bughunter_report, format_commit_preflight_report,
-        format_commit_skipped_report, format_compact_report, format_connected_line,
-        format_cost_report, format_history_timestamp, format_internal_prompt_progress_line,
-        format_issue_report, format_model_report, format_model_switch_report,
-        format_permissions_report, format_permissions_switch_report, format_pr_report,
-        format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
-        format_turn_budget_status_line,
-        format_ultraplan_report, format_unknown_slash_command,
-        format_unknown_slash_command_message, format_user_visible_api_error,
-        context_pressure_level,
-        merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
-        parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
-        parse_history_count, parse_repl_slash_command, permission_policy, print_help_to,
-        push_output_block, render_config_report, render_diff_report, render_diff_report_for,
-        render_memory_report, render_prompt_history_report, render_repl_help, render_resume_usage,
+        collect_session_prompt_history, context_pressure_level, create_managed_session_handle,
+        describe_tool_progress, filter_tool_specs, format_bughunter_report,
+        format_commit_preflight_report, format_commit_skipped_report, format_compact_report,
+        format_connected_line, format_cost_report, format_history_timestamp,
+        format_internal_prompt_progress_line, format_issue_report, format_model_report,
+        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
+        format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
+        format_tool_result, format_turn_budget_status_line, format_ultraplan_report,
+        format_unknown_slash_command, format_unknown_slash_command_message,
+        format_user_visible_api_error, merge_prompt_with_stdin, normalize_permission_mode,
+        parse_args, parse_export_args, parse_git_status_branch, parse_git_status_metadata_for,
+        parse_git_workspace_summary, parse_history_count, parse_repl_slash_command,
+        permission_policy, print_help_to, push_output_block, render_config_report,
+        render_diff_report, render_diff_report_for, render_memory_report,
+        render_prompt_history_report, render_repl_help, render_resume_usage,
         render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
         resolve_repl_model, resolve_session_reference, response_to_events,
         resume_supported_slash_commands, run_resume_command, short_tool_id,
         slash_command_completion_candidates_with_sessions, status_context,
-        summarize_tool_payload_for_markdown, validate_no_args, write_mcp_server_fixture,
+        summarize_tool_payload_for_markdown, unwrap_tool_use_wrapper, validate_no_args,
+        write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
+        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
+        PromptHistoryEntry, SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
+        STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
         PluginManager, PluginManagerConfig, PluginTool, PluginToolDefinition, PluginToolPermission,
     };
     use runtime::{
-        AssistantEvent, ConfigLoader, ContentBlock, ConversationMessage, MessageRole, OAuthConfig,
-        PermissionMode, Session, ToolExecutor, load_oauth_credentials, save_oauth_credentials,
+        load_oauth_credentials, save_oauth_credentials, AssistantEvent, ConfigLoader, ContentBlock,
+        ConversationMessage, MessageRole, OAuthConfig, PermissionMode, Session, ToolExecutor,
     };
     use serde_json::json;
     use std::fs;
@@ -10364,22 +10539,16 @@ mod tests {
         assert!(preflight.contains("Result           ready"));
         assert!(preflight.contains("Branch           feature/ux"));
         assert!(preflight.contains("Workspace        dirty · 2 files · 1 staged, 1 unstaged"));
-        assert!(
-            preflight.contains(
-                "Action           create a git commit from the current workspace changes"
-            )
-        );
+        assert!(preflight
+            .contains("Action           create a git commit from the current workspace changes"));
     }
 
     #[test]
     fn commit_skipped_report_points_to_next_steps() {
         let report = format_commit_skipped_report();
         assert!(report.contains("Reason           no workspace changes"));
-        assert!(
-            report.contains(
-                "Action           create a git commit from the current workspace changes"
-            )
-        );
+        assert!(report
+            .contains("Action           create a git commit from the current workspace changes"));
         assert!(report.contains("/status to inspect context"));
         assert!(report.contains("/diff to inspect repo changes"));
     }
@@ -11209,6 +11378,29 @@ UU conflicted.rs",
     }
 
     #[test]
+    fn unwraps_tool_use_wrapper_with_arguments_object() {
+        let wrapped = json!({
+            "name": "read_file",
+            "arguments": { "path": "README.md" }
+        });
+        let (name, args) = unwrap_tool_use_wrapper("tool_use", &wrapped)
+            .expect("tool_use wrapper should normalize");
+        assert_eq!(name, "read_file");
+        assert_eq!(args, json!({ "path": "README.md" }));
+    }
+
+    #[test]
+    fn unwraps_tool_use_wrapper_with_compact_name_payload() {
+        let wrapped = json!({
+            "name": "catargs={\"path\":\"app/config.py\"}"
+        });
+        let (name, args) = unwrap_tool_use_wrapper("tool_use", &wrapped)
+            .expect("compact tool_use payload should normalize");
+        assert_eq!(name, "read_file");
+        assert_eq!(args, json!({ "path": "app/config.py" }));
+    }
+
+    #[test]
     fn push_output_block_renders_markdown_text() {
         let mut out = Vec::new();
         let mut events = Vec::new();
@@ -11810,7 +12002,7 @@ fn write_mcp_server_fixture(script_path: &Path) {
 
 #[cfg(test)]
 mod sandbox_report_tests {
-    use super::{HookAbortMonitor, format_sandbox_report};
+    use super::{format_sandbox_report, HookAbortMonitor};
     use runtime::HookAbortSignal;
     use std::sync::mpsc;
     use std::time::Duration;
