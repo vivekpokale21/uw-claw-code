@@ -796,11 +796,15 @@ fn parse_single_word_command_alias(
             // "doctor --help" is valid, routed to parse_local_help_action() instead
             return None;
         }
-        // Unrecognized suffix like "--json"
-        return Some(Err(format!(
-            "unrecognized argument `{}` for subcommand `{}`",
-            rest[1], verb
-        )));
+        // Keep free-form shorthand prompts like `help me debug` working.
+        // Only reject flag-like suffixes that are likely subcommand misuse.
+        if rest[1].starts_with('-') {
+            return Some(Err(format!(
+                "unrecognized argument `{}` for subcommand `{}`",
+                rest[1], verb
+            )));
+        }
+        return None;
     }
 
     if rest.len() != 1 {
@@ -10219,7 +10223,6 @@ mod tests {
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
-                allow_broad_cwd: false,
             }
         );
     }
@@ -10238,7 +10241,6 @@ mod tests {
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
-                allow_broad_cwd: false,
             }
         );
     }
@@ -10258,7 +10260,6 @@ mod tests {
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
-                allow_broad_cwd: false,
             }
         );
     }
