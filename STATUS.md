@@ -1120,6 +1120,27 @@ Background framing for continuity:
       - `clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios`
       - failure class unchanged (`generated file should exist` in `mock_parity_harness.rs`).
 
+74. Upstream CLI/REPL resume-JSON parity intake batch 2 landed on sync branch:
+- imported from `upstream/main`:
+  - `7a6f7fe` (`4f670e5`): JSON output for `--resume` with no command in `--output-format json` mode.
+  - `cebf8b2` (`cf129c8`): JSON error emission when session load fails in JSON mode.
+  - `04e2032` (`3168642`): JSON parity for resumed `/help` and `/diff`.
+  - `10f8f10` (`78dca71`): JSON parity for resumed `/compact` and `/clear`.
+  - `43ca092` (`7587f2c`): JSON parity for resumed `/memory` and `/providers`.
+  - `3a96e04` (`7ec6860`): JSON emission for resumed `/config`.
+  - `1503b26` (`3ed27d5`): JSON emission for resumed `/history`.
+  - `e3aefc6` (`11e2353`): JSON parity for resumed `/export` and `/agents`.
+- merge/conflict note:
+  - `3168642` required one conflict resolution in `run_resume_command`.
+  - fork-local resume context behavior was preserved by using `session_path.parent()` for `/diff` report + JSON generation instead of process `cwd`.
+- verification:
+  - `cd rust && cargo test -p commands -- --test-threads=1` (`36 passed`, `0 failed`)
+  - `cd rust && cargo test -p rusty-claude-cli -- --test-threads=1`:
+    - passed: `172` `src/main.rs` tests + `7` `cli_flags_and_config_defaults` + `2` `compact_output`
+    - retained known pre-existing single failure:
+      - `clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios`
+      - unchanged generated-file-missing class in `mock_parity_harness.rs`.
+
 ## Known Gaps
 
 1. LSP now has cross-process lease supervision, but reusable LSP sessions are still process-local/in-memory (no shared daemon IPC session host yet).

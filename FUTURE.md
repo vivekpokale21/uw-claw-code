@@ -146,7 +146,8 @@ Last updated: 2026-04-22
 - Continue replacing mirrored command stubs with executable Python implementations for high-value slash paths.
 - Curate upstream `ultraworkers/claw-code` cherry-picks for CLI/REPL-only UX fixes while excluding Anthropic-first provider/auth assumptions.
 - Upstream intake batch 1 completed (2026-04-22): `4cb8fa0` (code-only), `f3f6643`, `a3270db`, `47aa1a5`, `60ec2ae`, plus fork-compat patch to keep shorthand prompt behavior for non-flag multi-word input.
-- Next upstream intake target: resume/json parity batch (`4f670e5`, `cf129c8`, `3168642`, `78dca71`, `7587f2c`, `7ec6860`, `3ed27d5`, `11e2353`) with the same provider/auth scope guard.
+- Upstream intake batch 2 completed (2026-04-22): `4f670e5`, `cf129c8`, `3168642`, `78dca71`, `7587f2c`, `7ec6860`, `3ed27d5`, `11e2353`; resumed `/diff` JSON parity was merged with fork-local `session_path.parent()` context preserved.
+- Next upstream intake target: operator UX polish batch (`7763ca3`, `79352a2`, `541c5bb`) with the same provider/auth scope guard.
 
 ## P2 — Runtime and Tooling Hardening
 
