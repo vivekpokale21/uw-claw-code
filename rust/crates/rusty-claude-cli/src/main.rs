@@ -717,16 +717,27 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             base_commit,
             reasoning_effort,
         ),
-        _other => Ok(CliAction::Prompt {
-            prompt: rest.join(" "),
-            model,
-            output_format,
-            allowed_tools,
-            permission_mode,
-            compact,
-            base_commit,
-            reasoning_effort: reasoning_effort.clone(),
-        }),
+        _other => {
+            // Keep positional fallthrough ergonomic, but reject empty/whitespace
+            // prompts so users get actionable local guidance instead of an API auth error.
+            let joined = rest.join(" ");
+            if joined.trim().is_empty() {
+                return Err(
+                    "empty prompt: provide a subcommand (run `claw --help`) or a non-empty prompt string"
+                        .to_string(),
+                );
+            }
+            Ok(CliAction::Prompt {
+                prompt: joined,
+                model,
+                output_format,
+                allowed_tools,
+                permission_mode,
+                compact,
+                base_commit,
+                reasoning_effort: reasoning_effort.clone(),
+            })
+        }
     }
 }
 
@@ -9514,6 +9525,24 @@ mod tests {
                 args: Some("--help".to_string()),
                 output_format: CliOutputFormat::Text,
             }
+        );
+        let empty_err =
+            parse_args(&["".to_string()]).expect_err("empty positional arg should be rejected");
+        assert!(
+            empty_err.starts_with("empty prompt:"),
+            "empty-arg error should be specific, got: {empty_err}"
+        );
+        let whitespace_err = parse_args(&["   ".to_string()])
+            .expect_err("whitespace-only positional arg should be rejected");
+        assert!(
+            whitespace_err.starts_with("empty prompt:"),
+            "whitespace-only error should be specific, got: {whitespace_err}"
+        );
+        let multi_empty_err = parse_args(&["".to_string(), "".to_string()])
+            .expect_err("multiple empty positional args should be rejected");
+        assert!(
+            multi_empty_err.starts_with("empty prompt:"),
+            "multi-empty error should be specific, got: {multi_empty_err}"
         );
     }
 
