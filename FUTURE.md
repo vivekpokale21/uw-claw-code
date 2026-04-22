@@ -1,6 +1,6 @@
 # FUTURE.md
 
-Last updated: 2026-04-09
+Last updated: 2026-04-22
 
 ## Migration Slices (AFK Local-First Port)
 
@@ -40,10 +40,38 @@ Last updated: 2026-04-09
   - baseline task-success target missed (`1/8` successful target edits in task worktrees)
   - post-compat task-success still below target (`3/8` strict successful target edits in task worktrees)
   - retrieval A/B blocked until baseline no-op/path-targeting failures are reduced
+- Current state update (2026-04-22 harness-integrity pass, rerun completed):
+  - latest wired fallback reference run (`/tmp/qwen_matrix_semantic_wired_fallback_20260416_122959`) exposed two integrity artifacts:
+    - `.semantic_search/` writes were counted as meaningful repo edits
+    - already-satisfied tasks still consumed model turns and failed meaningful-change gates
+  - ladder harness now includes:
+    - artifact-aware meaningful-change filtering (`.claw/`, `.port_sessions/`, `.semantic_search/`)
+    - precheck short-circuit (`QWEN35_MATRIX_PRECHECK_TASKS`, `QWEN35_MATRIX_SKIP_IF_PRECHECK_PASS`)
+    - phased executor passes for long tasks (`QWEN35_MATRIX_EXECUTOR_PASSES`)
+    - stage-specific executor timeout budget (`QWEN35_MATRIX_EXECUTOR_TIMEOUT_SECS`, default `1200s`)
+    - executor-only loop stall controls (`QWEN35_MATRIX_EXECUTOR_TOOL_LOOP_STALL_LIMIT`, `QWEN35_MATRIX_EXECUTOR_NO_PROGRESS_STALL_LIMIT`)
+    - context-window short-circuit acceptance when objective checks already pass
+  - rerun evidence (`/tmp/qwen_matrix_perf_guard_20260422_141026`):
+    - strict result: `6/8` task pass, total `1,714,174 ms`, avg `214,271 ms/task`
+    - first-7-task wall-time improvement vs prior post-timeout run: `-17.60%` (`1,427,123 ms` vs `1,731,993 ms`)
+    - remaining strict-fail cluster stayed concentrated in late tasks (time-filters/client-config docs segment)
+  - profile-split follow-up (2026-04-22):
+    - harness now supports explicit runtime profiles (`quality`, `balanced`, `fast`) via `QWEN35_MATRIX_RUNTIME_PROFILE`.
+    - `balanced` top-3 rerun (`/tmp/qwen_matrix_balanced_top3_20260422_153116`) preserved strict pass (`3/3`) but was slower than prior top-3 reference (`+44.50%` wall time vs `/tmp/qwen_matrix_perf_guard_20260422_141026`).
+    - `fast` top-3 rerun (`/tmp/qwen_matrix_fast_top3_20260422_154504`) recovered throughput (`-64.09%` wall time vs same reference) but failed strict integrity (`0/3`) due zero-edit executor exits.
+    - post-regression rerun after executor path/toolset hardening (`/tmp/qwen_matrix_post_bash_regression_debug`) kept strict pass (`3/3`) and cut balanced top-3 wall time by `-20.12%` vs prior balanced baseline (`606,924 ms` vs `759,752 ms`).
+    - remaining inflation is localized: task 1 `-25.92%`, task 2 `-34.06%`, task 3 `+3.57%` (extra pass/retry churn).
+    - follow-up rerun after `no_progress_stalled` objective-success acceptance (`/tmp/qwen_matrix_post_stall_accept_20260422_194524`) kept strict pass (`3/3`) and reduced balanced top-3 wall time further to `499,062 ms` (`-34.31%` vs balanced baseline, `-17.77%` vs post-bash rerun).
+    - task-level shift in latest rerun: task 2 `180,100 ms`, task 3 `174,831 ms`; these were the prior churn hotspots.
+    - stage metrics now include explicit `bash_calls` for executor drift attribution.
+  - experimental objective-gated follow-up (forcing pass/retry when interim checks fail) was tested and reverted after increasing runtime on failing paths without recovering strict-pass on the persistent docs task.
 - Immediate follow-up focus:
+  - add a lightweight safeguard so `no_progress_stalled` objective acceptance only triggers when edit history in the stage is non-trivial (avoid accepting pathological read-only stalls).
   - add guardrails for whitespace-collapsed write/edit payloads from local Qwen tool calls
   - add stricter timeout/no-progress handling for multi-step wandering tool loops
   - keep rerunning the same 8-task ladder until strict target-edit success reaches acceptance threshold before retrieval A/B phase
+  - quantify precheck-hit rate and artifact-only-change rate in `summary.tsv` after the new harness changes
+  - add targeted late-pipeline guidance for docs/contract tasks (task-8 class) so retries stop converging to check-failing partial docs edits
 
 1. Tune loop budgets for overnight stability
 - Keep new loop-profile controls stable (`normal`/`light`/`aggressive`/`auto`).
@@ -116,6 +144,9 @@ Last updated: 2026-04-09
 - Keep launcher chat-surface routing stable (`--chat-surface`, `--python-ui`, `--rust-ui`, `CLAW_CHAT_SURFACE`) and avoid regressions in mode/arg parsing.
 - Keep per-turn context/token telemetry stable in `/status` + `/cost` while extending parity with upstream statusline style.
 - Continue replacing mirrored command stubs with executable Python implementations for high-value slash paths.
+- Curate upstream `ultraworkers/claw-code` cherry-picks for CLI/REPL-only UX fixes while excluding Anthropic-first provider/auth assumptions.
+- Upstream intake batch 1 completed (2026-04-22): `4cb8fa0` (code-only), `f3f6643`, `a3270db`, `47aa1a5`, `60ec2ae`, plus fork-compat patch to keep shorthand prompt behavior for non-flag multi-word input.
+- Next upstream intake target: resume/json parity batch (`4f670e5`, `cf129c8`, `3168642`, `78dca71`, `7587f2c`, `7ec6860`, `3ed27d5`, `11e2353`) with the same provider/auth scope guard.
 
 ## P2 — Runtime and Tooling Hardening
 

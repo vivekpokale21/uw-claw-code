@@ -1,6 +1,6 @@
 # STATUS.md
 
-Last updated: 2026-04-09
+Last updated: 2026-04-22
 
 ## Migration Slices (AFK Local-First Port)
 
@@ -982,6 +982,144 @@ Background framing for continuity:
   - `bash -n scripts/start_claw_cli.sh` (`OK`)
   - `python3 -m unittest discover -s tests -v` (`Ran 156 tests`, `OK`)
 
+65. Qwen ladder harness-integrity hardening landed for structured long-task execution:
+- benchmark evidence used from latest wired fallback run:
+  - `/tmp/qwen_matrix_semantic_wired_fallback_20260416_122959`
+  - observed integrity gaps:
+    - artifact-only changes under `.semantic_search/` could be miscounted as meaningful edits
+    - already-satisfied tasks could burn model turns and fail meaningful-change gating despite passing checks
+- `scripts/run_qwen35_ladder.sh` updates:
+  - meaningful-change filter now ignores `.semantic_search/` alongside `.claw/` and `.port_sessions/`.
+  - new precheck flow:
+    - `QWEN35_MATRIX_PRECHECK_TASKS` (default `1`)
+    - `QWEN35_MATRIX_SKIP_IF_PRECHECK_PASS` (default `1`)
+    - when checks already pass on a clean worktree, model stages are skipped and task marked `precheck_satisfied=1`.
+  - new structured long-task executor phases:
+    - `QWEN35_MATRIX_EXECUTOR_PASSES` (default `1`)
+    - planner checklist is extracted and fed into additional `executor_pass` stages before retry loop, enabling phased completion for longer tasks.
+  - summary contract extended with `precheck_satisfied` column for downstream analysis.
+- validation:
+  - `bash -n scripts/run_qwen35_ladder.sh` (`OK`)
+  - `./scripts/run_qwen35_ladder.sh --help` now lists new env knobs.
+
+66. Executor timeout budget extended for long-context task quality:
+- benchmark observation from 2026-04-22 traced run (`/tmp/qwen_matrix_debug_trace_1776845652`):
+  - task 1 executor hit the old hard wall (`rc=124` at `180s`) before completion and only progressed through later passes.
+  - with 64k context and ~30 tok/s practical throughput, 180s is undersized for quality-first long executor turns.
+- `scripts/run_qwen35_ladder.sh` now supports stage-specific timeout budgeting:
+  - new env: `QWEN35_MATRIX_EXECUTOR_TIMEOUT_SECS` (default `1200`).
+  - planner/repair continue using `QWEN35_MATRIX_TIMEOUT_SECS` (default `180`), while executor/pass/retry stages use the executor timeout budget.
+  - startup logs now print both `timeout` and `executor_timeout`.
+- validation:
+  - `bash -n scripts/run_qwen35_ladder.sh` (`OK`)
+  - `./scripts/run_qwen35_ladder.sh --help` includes `QWEN35_MATRIX_EXECUTOR_TIMEOUT_SECS`.
+
+67. Executor loop guardrails + context-window short-circuit landed in local ladder harness:
+- `scripts/run_qwen35_ladder.sh` now adds executor-only runtime loop controls:
+  - `QWEN35_MATRIX_EXECUTOR_TOOL_LOOP_STALL_LIMIT` (default `3`)
+  - `QWEN35_MATRIX_EXECUTOR_NO_PROGRESS_STALL_LIMIT` (default `2`)
+  - exported as `CLAW_TOOL_LOOP_STALL_LIMIT` / `CLAW_NO_PROGRESS_STALL_LIMIT` for executor/pass/retry stages only.
+- context-window-aware acceptance path added:
+  - detects executor-stage context-window failures from stage logs.
+  - if objective checks already pass on that stage, accepts the stage result and skips unnecessary follow-up passes.
+- benchmark rerun evidence (`/tmp/qwen_matrix_perf_guard_20260422_141026`):
+  - completed `8` tasks, strict `task_pass=6/8`, total `1,714,174 ms` (avg `214,271 ms/task`).
+  - compared with prior post-timeout run (`/tmp/qwen_matrix_post_timeout_fix_20260422_122630`, first 7 tasks): wall time improved by `-17.60%` (`1,427,123 ms` vs `1,731,993 ms`), but strict pass count dropped (`6/7` vs `7/7`).
+  - confirmed real context-window short-circuit on task 1 (overflow detected, checks passed, extra pass avoided).
+
+68. Objective-gated follow-up experiment was tested and reverted:
+- attempted variant: force executor/pass/retry follow-up whenever interim objective checks were not yet satisfied.
+- measured outcome on canonical late-pipeline slice (`/tmp/qwen_matrix_canonical_6_8_20260422_150653`):
+  - tasks 1 and 2 passed, task 3 still failed despite extra passes/retry.
+  - wall-clock cost increased substantially on failing path (task 3 consumed `392,577 ms` with no strict-pass improvement).
+- decision:
+  - reverted that variant and retained only the speed-positive guardrails from item 67.
+
+69. Runtime profiles added for explicit speed-vs-integrity control in ladder harness:
+- `scripts/run_qwen35_ladder.sh` now supports `QWEN35_MATRIX_RUNTIME_PROFILE`:
+  - `quality`: executor timeout `1200s`, passes `3`, retries `1`, stall limits `3/2`
+  - `balanced` (default): executor timeout `360s`, passes `2`, retries `1`, stall limits `3/2`
+  - `fast`: executor timeout `180s`, passes `1`, retries `0`, stall limits `2/1`
+- profile defaults are override-safe:
+  - explicit envs (`QWEN35_MATRIX_EXECUTOR_TIMEOUT_SECS`, `QWEN35_MATRIX_EXECUTOR_PASSES`, `QWEN35_MATRIX_MAX_EXECUTOR_RETRIES`, executor stall-limit envs) still take precedence.
+- startup logs now print `runtime_profile=<...>` for auditability.
+- validation:
+  - `bash -n scripts/run_qwen35_ladder.sh` (`OK`)
+
+70. New benchmark evidence confirms strong speed/quality tradeoff across profiles:
+- completed top-3 integrity slice with `balanced` profile:
+  - run: `/tmp/qwen_matrix_balanced_top3_20260422_153116`
+  - result: `3/3` strict pass, total `759,752 ms`
+  - compared to prior top-3 reference (`/tmp/qwen_matrix_perf_guard_20260422_141026`, `525,767 ms`): `+44.50%` slower.
+  - main inflation source: task 2 executor (`284,442 ms`, `37` tool calls with `33` edit calls).
+- completed top-3 with `fast` profile:
+  - run: `/tmp/qwen_matrix_fast_top3_20260422_154504`
+  - result: `0/3` strict pass, total `188,791 ms` (`-64.09%` vs `perf_guard` top-3 wall time)
+  - failure mode: each executor exited quickly with zero edit-capable calls (`verify safeguard failed`), demonstrating that pure-fast settings are unsuitable for integrity runs.
+- in-turn verification reruns:
+  - `cargo test -p commands -- --test-threads=1` passed (`36/36`)
+  - `cargo test -p rusty-claude-cli -- --test-threads=1` retained known single failure:
+    - `clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios`
+    - missing generated file in `mock_parity_harness.rs` path.
+
+71. Harness drift regression mitigations improved balanced integrity throughput while preserving strict pass:
+- `scripts/run_qwen35_ladder.sh` hardening updates:
+  - executor prompts now anchor file paths to the active worktree and explicitly disallow `/app/...` absolute-path assumptions.
+  - default first-pass executor toolset no longer includes `bash`; `bash` remains available in retry/repair toolsets.
+  - new guardrail `QWEN35_MATRIX_EXECUTOR_BASH_LOOP_CUTOFF` (default `12`) now stops additional pass/retry follow-up when bash-heavy execution shows no objective progress.
+  - stage metrics/logging now emits explicit `bash_calls` counts per stage for regression attribution.
+- benchmark rerun evidence (`/tmp/qwen_matrix_post_bash_regression_debug`), compared to prior balanced top-3 baseline (`/tmp/qwen_matrix_balanced_top3_20260422_153116`):
+  - strict pass stayed `3/3`.
+  - total wall time improved by `-20.12%` (`606,924 ms` vs `759,752 ms`).
+  - task-level totals:
+    - task 1: `-25.92%` (`129,562 ms` vs `174,892 ms`)
+    - task 2: `-34.06%` (`225,020 ms` vs `341,224 ms`)
+    - task 3: `+3.57%` (`252,342 ms` vs `243,636 ms`) due extra executor pass/retry.
+  - executor-family tool/request churn:
+    - task 1: tool calls `8` vs `17`; requests `8` vs `18`.
+    - task 2: tool calls `26` vs `37`; requests `27` vs `38`.
+    - task 3: tool calls `20` vs `10`; requests `22` vs `11` (remaining drift pocket).
+- validation:
+  - `bash -n scripts/run_qwen35_ladder.sh` (`OK`)
+  - `python3 -m unittest -q tests/test_porting_workspace.py` (`Ran 22 tests`, `OK`)
+
+72. Stall-aware objective acceptance reduced residual pass/retry churn on balanced top-3:
+- regression root in prior tuned run (`/tmp/qwen_matrix_post_bash_regression_debug`):
+  - task 3 executor made meaningful edits, then ended `stop_reason=no_progress_stalled`, which triggered extra pass/retry despite objective checks already being satisfiable.
+- `scripts/run_qwen35_ladder.sh` update:
+  - objective-success short-circuit now applies to `no_progress_stalled` terminal failures (not only context-window failures).
+  - when objective checks pass (`py_compile`, task checks, meaningful-change gate), executor stage is accepted and follow-up passes/retries are skipped.
+- benchmark evidence (`/tmp/qwen_matrix_post_stall_accept_20260422_194524`):
+  - strict pass remained `3/3`.
+  - total wall time improved to `499,062 ms`:
+    - `-34.31%` vs balanced baseline (`759,752 ms`, `/tmp/qwen_matrix_balanced_top3_20260422_153116`)
+    - `-17.77%` vs prior post-bash run (`606,924 ms`, `/tmp/qwen_matrix_post_bash_regression_debug`)
+  - task-level totals:
+    - task 2: `180,100 ms` (was `225,020 ms` post-bash; `341,224 ms` baseline)
+    - task 3: `174,831 ms` (was `252,342 ms` post-bash; `243,636 ms` baseline)
+    - task 1 varied run-to-run (`144,131 ms` vs `129,562 ms` post-bash), but overall profile still improved materially.
+- validation:
+  - `bash -n scripts/run_qwen35_ladder.sh` (`OK`)
+  - `python3 -m unittest -q tests/test_porting_workspace.py` (`Ran 22 tests`, `OK`)
+
+73. Upstream CLI/REPL parser-intake batch 1 landed on sync branch (`sync/upstream-cli-repl-batch1-20260422`):
+- imported from `upstream/main` (CLI/REPL scope only):
+  - `53a10fc` (`4cb8fa0` code-only intake): reject empty/whitespace fallthrough prompts in CLI shorthand path.
+  - `148d99f` (`f3f6643`): did-you-mean guard for single-token subcommand typos.
+  - `b6bbfe2` (`a3270db`): diagnostic verb suffix validation.
+  - `8017df5` (`47aa1a5`): include command name in "not yet implemented" REPL message.
+  - `07e3507` (`60ec2ae`): wire `/tokens` and `/cache` aliases to `/stats`.
+- local compatibility follow-up:
+  - `1739a90`: preserve shorthand prompt behavior for non-flag multi-word input (for example `help me debug`) while still rejecting flag-like diagnostic misuse.
+  - this keeps fork-local prompt ergonomics intact after upstream #127 intake.
+- verification:
+  - `cd rust && cargo test -p commands -- --test-threads=1` (`36 passed`, `0 failed`)
+  - `cd rust && cargo test -p rusty-claude-cli -- --test-threads=1`:
+    - core/unit integration surface passed (`172` main tests + `7` cli_flags + `2` compact_output),
+    - retained known pre-existing failure:
+      - `clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios`
+      - failure class unchanged (`generated file should exist` in `mock_parity_harness.rs`).
+
 ## Known Gaps
 
 1. LSP now has cross-process lease supervision, but reusable LSP sessions are still process-local/in-memory (no shared daemon IPC session host yet).
@@ -990,6 +1128,7 @@ Background framing for continuity:
 4. Turn-loop no-op detection now exists (`turn_no_progress_stalled`), but tuning is still static and not yet auto-calibrated per repo profile.
 5. Semantic index still assumes a single embedding model per built index; switching models requires rebuild and there is no automatic migration flow.
 6. Chat-mode slash commands currently map to implemented Python surfaces; mirrored archive command entries are still mostly metadata/stub execution paths.
+7. Upstream `ultraworkers/claw-code` is now ahead by ~214 commits; CLI/REPL cherry-pick intake is not yet curated/applied for this local-Qwen fork.
 
 ## Next Step
 
@@ -998,3 +1137,4 @@ Implement Slice 2 adapters:
 2. Coordinator runtime hardening (add richer lane-specific adaptive backoff curves and cooldown shaping, not just threshold bumps).
 3. Small-model memory quality hardening follow-up (confidence scoring + longer-horizon decay policy on top of the new structured lifecycle/trend baseline).
 4. Semantic index UX hardening (provider presets, clear rebuild prompts, and model/profile checks).
+5. Curate and apply upstream CLI/REPL-only commits from `ultraworkers/claw-code` (exclude provider/auth surface that assumes Anthropic-first runtime).
